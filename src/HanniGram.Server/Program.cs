@@ -51,21 +51,23 @@ app.MapGet("/api/projects/current", (HttpRequest req) =>
 app.MapPost("/api/observations", (HttpRequest req, ObservationBody body) =>
 {
     var p = ResolveProject(req);
-    var obs = store.SaveObservation(
+    var (obs, created) = store.SaveObservation(
         p.Id, body.Title, body.Content ?? "",
         body.What, body.Why, body.Where, body.Learned, body.TopicKey, body.Type);
-    return Results.Json(obs, json);
+    return Results.Json(new { observation = obs, created }, json);
 });
 
-app.MapGet("/api/observations/{id:long}", (long id) =>
+app.MapGet("/api/observations/{id:long}", (long id, HttpRequest req) =>
 {
-    var obs = store.GetObservation(id);
+    var p = ResolveProject(req);
+    var obs = store.GetObservation(p.Id, id);
     return obs is null ? Results.NotFound() : Results.Json(obs, json);
 });
 
-app.MapDelete("/api/observations/{id:long}", (long id) =>
+app.MapDelete("/api/observations/{id:long}", (long id, HttpRequest req) =>
 {
-    var deleted = store.DeleteObservation(id);
+    var p = ResolveProject(req);
+    var deleted = store.DeleteObservation(p.Id, id);
     return deleted ? Results.Ok(new { deleted = true, id }) : Results.NotFound();
 });
 
@@ -82,10 +84,10 @@ app.MapGet("/api/observations/topic/{topicKey}", (string topicKey, HttpRequest r
 });
 
 // ---- Search (FTS5) ----
-app.MapGet("/api/search", (HttpRequest req, string q, int limit = 10) =>
+app.MapGet("/api/search", (HttpRequest req, string q, int limit = 10, string? type = null, string? topicKey = null) =>
 {
     var p = ResolveProject(req);
-    return Results.Json(store.Search(p.Id, q, limit), json);
+    return Results.Json(store.Search(p.Id, q, limit, type, topicKey), json);
 });
 
 // ---- Topic keys ----

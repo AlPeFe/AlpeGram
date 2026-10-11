@@ -69,11 +69,11 @@ try
         {
             var title = rest.FirstOrDefault(a => !a.StartsWith("--")) ?? throw new ArgumentException("title required");
             var p = store.GetOrCreateProject(resolvedProject, cwd);
-            var obs = store.SaveObservation(p.Id, title,
+            var (obs, created) = store.SaveObservation(p.Id, title,
                 Flag(rest, "--content") ?? "",
                 Flag(rest, "--what"), Flag(rest, "--why"), Flag(rest, "--where"),
                 Flag(rest, "--learned"), Flag(rest, "--topic"), Flag(rest, "--type"));
-            Console.WriteLine($"saved #{obs.Id} [{p.Name}] {obs.Title}");
+            Console.WriteLine($"{(created ? "saved" : "updated")} #{obs.Id} [{p.Name}] {obs.Title}");
             break;
         }
 

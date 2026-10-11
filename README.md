@@ -25,7 +25,7 @@ SQLite + FTS5 (~/.hannigram/hannigram.db)
 - **Búsqueda de texto completo** — SQLite FTS5 sobre las observaciones, con **tokenizer trigram**: tolera typos (buscar `rozado` encuentra `rosado`), substrings y CJK. Si el match estricto no da resultados, reintenta con los trigramas de la query (fuzzy) rankeado por bm25.
 - **ADR / decisiones** — las observaciones con `type=adr` y `topic_key=adr/<slug>` son decisiones de arquitectura/convención (p.ej. `adr/ui/palette`). Son la base de "respetar estilos": HanniPI las consulta antes de implementar en zonas cubiertas, sin redefinirlas en cada prompt.
 - **Memoria local exportada** — `hannigram init` crea el proyecto en la BD **y** escribe `.hannigram/memory.md` en el proyecto: una vista markdown de las decisiones, para que cualquier harness (o persona) que solo trabaje con ficheros lea la memoria sin depender del daemon. La BD sigue siendo la fuente de verdad.
-- **Topic keys** — claves estables (`architecture/auth-model`) para mantener el conocimiento evolutivo en un solo lugar.
+- **Topic keys** — claves estables (`architecture/auth-model`) para mantener el conocimiento evolutivo en un solo lugar. Guardar con un `topic_key` ya existente **actualiza** la observación (upsert) en vez de crear una versión duplicada.
 - **Sesiones + handoff** — `session_summary` guarda objetivo, descubrimientos y próximos pasos para que la siguiente sesión recupere el contexto.
 
 ## Arquitectura
@@ -53,11 +53,12 @@ dotnet run -c Release
 | GET | `/health` | Health + ruta de la BD |
 | GET | `/api/projects` | Listar proyectos |
 | GET | `/api/projects/current?cwd=` | Resolver proyecto para un cwd |
-| POST | `/api/observations?cwd=` | Guardar una observación |
-| GET | `/api/observations/{id}` | Obtener una observación |
+| POST | `/api/observations?cwd=` | Guardar una observación (upsert por `topic_key`) |
+| GET | `/api/observations/{id}?cwd=` | Obtener una observación (escopada al proyecto) |
 | GET | `/api/observations?cwd=&limit=` | Observaciones recientes |
 | GET | `/api/observations/topic/{key}?cwd=` | Observaciones por topic key |
-| GET | `/api/search?cwd=&q=&limit=` | Búsqueda FTS5 |
+| DELETE | `/api/observations/{id}?cwd=` | Borrar una observación (escopada al proyecto) |
+| GET | `/api/search?cwd=&q=&limit=&type=&topicKey=` | Búsqueda FTS5 (filtro opcional por `type` y `topicKey`) |
 | GET | `/api/topics?cwd=` | Topic keys existentes |
 | POST | `/api/sessions/start?cwd=` | Iniciar una sesión |
 | POST | `/api/sessions/end?cwd=` | Terminar una sesión (summary) |

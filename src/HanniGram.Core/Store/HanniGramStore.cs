@@ -106,7 +106,7 @@ public sealed class HanniGramStore : IDisposable
         using var cmd = _conn.CreateCommand();
         cmd.CommandText = "INSERT INTO projects (name, root_path, created_at_utc, updated_at_utc) VALUES ($n, $r, $c, $u); SELECT last_insert_rowid();";
         cmd.Parameters.AddWithValue("$n", name);
-        cmd.Parameters.AddWithValue("$r", rootPath);
+        cmd.Parameters.AddWithValue("$r", (object?)rootPath ?? DBNull.Value);
         cmd.Parameters.AddWithValue("$c", Now());
         cmd.Parameters.AddWithValue("$u", Now());
         var id = (long)cmd.ExecuteScalar()!;
@@ -127,45 +127,90 @@ public sealed class HanniGramStore : IDisposable
     // Observations
     // =====================================================================
 
-    public Observation SaveObservation(long projectId, string title, string content,
+    /// <summary>
+    /// Save an observation scoped to a project. When <paramref name="topicKey"/> is
+    /// provided, this is an UPSERT keyed on (project, topic_key): an existing
+    /// observation with the same key is updated in place (its id and created_at are
+    /// preserved) so a topic evolves instead of accumulating stale versions. Without
+    /// a topic key, a new observation is always inserted.
+    /// Returns the persisted observation and whether it was newly created.
+    /// </summary>
+    public (Observation Observation, bool Created) SaveObservation(long projectId, string title, string content,
         string? what = null, string? why = null, string? where = null, string? learned = null,
         string? topicKey = null, string? type = null)
     {
-        using var cmd = _conn.CreateCommand();
-        cmd.CommandText = @"
-            INSERT INTO observations (project_id, title, content, what, why, where_, learned, topic_key, type, created_at_utc, updated_at_utc)
-            VALUES ($p, $t, $c, $w, $y, $wh, $l, $tk, $ty, $n, $n);
-            SELECT last_insert_rowid();";
-        cmd.Parameters.AddWithValue("$p", projectId);
-        cmd.Parameters.AddWithValue("$t", title);
-        cmd.Parameters.AddWithValue("$c", content);
-        cmd.Parameters.AddWithValue("$w", (object?)what ?? DBNull.Value);
-        cmd.Parameters.AddWithValue("$y", (object?)why ?? DBNull.Value);
-        cmd.Parameters.AddWithValue("$wh", (object?)where ?? DBNull.Value);
-        cmd.Parameters.AddWithValue("$l", (object?)learned ?? DBNull.Value);
-        cmd.Parameters.AddWithValue("$tk", (object?)topicKey ?? DBNull.Value);
-        cmd.Parameters.AddWithValue("$ty", (object?)type ?? DBNull.Value);
-        cmd.Parameters.AddWithValue("$n", Now());
-        var id = (long)cmd.ExecuteScalar()!;
+        var existing = string.IsNullOrEmpty(topicKey) ? null : FindLatestByTopicKey(projectId, topicKey);
+        long id;
+        var created = existing is null;
+        if (created)
+        {
+            using var cmd = _conn.CreateCommand();
+            cmd.CommandText = @"
+                INSERT INTO observations (project_id, title, content, what, why, where_, learned, topic_key, type, created_at_utc, updated_at_utc)
+                VALUES ($p, $t, $c, $w, $y, $wh, $l, $tk, $ty, $n, $n);
+                SELECT last_insert_rowid();";
+            cmd.Parameters.AddWithValue("$p", projectId);
+            cmd.Parameters.AddWithValue("$t", title);
+            cmd.Parameters.AddWithValue("$c", content);
+            cmd.Parameters.AddWithValue("$w", (object?)what ?? DBNull.Value);
+            cmd.Parameters.AddWithValue("$y", (object?)why ?? DBNull.Value);
+            cmd.Parameters.AddWithValue("$wh", (object?)where ?? DBNull.Value);
+            cmd.Parameters.AddWithValue("$l", (object?)learned ?? DBNull.Value);
+            cmd.Parameters.AddWithValue("$tk", (object?)topicKey ?? DBNull.Value);
+            cmd.Parameters.AddWithValue("$ty", (object?)type ?? DBNull.Value);
+            cmd.Parameters.AddWithValue("$n", Now());
+            id = (long)cmd.ExecuteScalar()!;
+        }
+        else
+        {
+            id = existing!.Id;
+            using var cmd = _conn.CreateCommand();
+            cmd.CommandText = @"
+                UPDATE observations
+                SET title = $t, content = $c, what = $w, why = $y, where_ = $wh, learned = $l, type = $ty, updated_at_utc = $n
+                WHERE id = $id";
+            cmd.Parameters.AddWithValue("$t", title);
+            cmd.Parameters.AddWithValue("$c", content);
+            cmd.Parameters.AddWithValue("$w", (object?)what ?? DBNull.Value);
+            cmd.Parameters.AddWithValue("$y", (object?)why ?? DBNull.Value);
+            cmd.Parameters.AddWithValue("$wh", (object?)where ?? DBNull.Value);
+            cmd.Parameters.AddWithValue("$l", (object?)learned ?? DBNull.Value);
+            cmd.Parameters.AddWithValue("$ty", (object?)type ?? DBNull.Value);
+            cmd.Parameters.AddWithValue("$n", Now());
+            cmd.Parameters.AddWithValue("$id", id);
+            cmd.ExecuteNonQuery();
+        }
         SyncFtsRow(id);
-        return GetObservation(id)!;
+        return (GetObservation(projectId, id)!, created);
     }
 
-	public Observation? GetObservation(long id)
+    private Observation? FindLatestByTopicKey(long projectId, string topicKey)
+    {
+        using var cmd = _conn.CreateCommand();
+        cmd.CommandText = "SELECT id, project_id, title, content, what, why, where_, learned, topic_key, type, created_at_utc, updated_at_utc FROM observations WHERE project_id = $p AND topic_key = $tk ORDER BY created_at_utc DESC LIMIT 1";
+        cmd.Parameters.AddWithValue("$p", projectId);
+        cmd.Parameters.AddWithValue("$tk", topicKey);
+        using var r = cmd.ExecuteReader();
+        return r.Read() ? ReadObservation(r) : null;
+    }
+
+	public Observation? GetObservation(long projectId, long id)
 	{
 		using var cmd = _conn.CreateCommand();
-		cmd.CommandText = "SELECT id, project_id, title, content, what, why, where_, learned, topic_key, type, created_at_utc, updated_at_utc FROM observations WHERE id = $id";
+		cmd.CommandText = "SELECT id, project_id, title, content, what, why, where_, learned, topic_key, type, created_at_utc, updated_at_utc FROM observations WHERE id = $id AND project_id = $p";
 		cmd.Parameters.AddWithValue("$id", id);
+		cmd.Parameters.AddWithValue("$p", projectId);
 		using var r = cmd.ExecuteReader();
 		return r.Read() ? ReadObservation(r) : null;
 	}
 
-	/// <summary>Delete an observation and its FTS row. Returns true if it existed.</summary>
-	public bool DeleteObservation(long id)
+	/// <summary>Delete an observation (scoped to a project) and its FTS row. Returns true if it existed.</summary>
+	public bool DeleteObservation(long projectId, long id)
 	{
 		using var cmd = _conn.CreateCommand();
-		cmd.CommandText = "DELETE FROM observations WHERE id = $id";
+		cmd.CommandText = "DELETE FROM observations WHERE id = $id AND project_id = $p";
 		cmd.Parameters.AddWithValue("$id", id);
+		cmd.Parameters.AddWithValue("$p", projectId);
 		var deleted = cmd.ExecuteNonQuery() > 0;
 		if (deleted)
 		{
@@ -201,33 +246,37 @@ public sealed class HanniGramStore : IDisposable
         return list;
     }
 
-    public IReadOnlyList<SearchHit> Search(long projectId, string query, int limit = 10)
+    public IReadOnlyList<SearchHit> Search(long projectId, string query, int limit = 10, string? type = null, string? topicKey = null)
     {
-        var hits = SearchCore(projectId, FtsQuery(query), limit);
+        var hits = SearchCore(projectId, FtsQuery(query), limit, type, topicKey);
         // Trigram tokenizer matches substrings, not fuzzy typos. When a strict
         // AND match finds nothing, retry with OR of the query's trigrams so a
         // typo'd word (1-3 chars off in a long word) still matches documents
         // sharing enough trigrams, ranked by bm25.
         if (hits.Count == 0 && query.Where(char.IsLetterOrDigit).Count() >= 6)
         {
-            hits = SearchCore(projectId, FtsTrigramFallback(query), limit);
+            hits = SearchCore(projectId, FtsTrigramFallback(query), limit, type, topicKey);
         }
         return hits;
     }
 
-    private List<SearchHit> SearchCore(long projectId, string ftsQuery, int limit)
+    private List<SearchHit> SearchCore(long projectId, string ftsQuery, int limit, string? type = null, string? topicKey = null)
     {
         var list = new List<SearchHit>();
         using var cmd = _conn.CreateCommand();
-        cmd.CommandText = @"
+        var sql = @"
             SELECT o.id, o.title, o.content, o.topic_key, o.type, o.created_at_utc, bm25(observations_fts) AS rank
             FROM observations_fts
             JOIN observations o ON o.id = observations_fts.rowid
-            WHERE observations_fts MATCH $q AND o.project_id = $p
-            ORDER BY rank
-            LIMIT $l;";
+            WHERE observations_fts MATCH $q AND o.project_id = $p";
+        if (type is not null) sql += " AND o.type = $ty";
+        if (topicKey is not null) sql += " AND o.topic_key = $tk";
+        sql += "\n            ORDER BY rank\n            LIMIT $l;";
+        cmd.CommandText = sql;
         cmd.Parameters.AddWithValue("$q", ftsQuery);
         cmd.Parameters.AddWithValue("$p", projectId);
+        if (type is not null) cmd.Parameters.AddWithValue("$ty", type);
+        if (topicKey is not null) cmd.Parameters.AddWithValue("$tk", topicKey);
         cmd.Parameters.AddWithValue("$l", limit);
         using var r = cmd.ExecuteReader();
         while (r.Read())
@@ -317,6 +366,15 @@ public sealed class HanniGramStore : IDisposable
 
     private void SyncFtsRow(long id)
     {
+        // External-content FTS5: delete any existing index entry for this rowid,
+        // then re-insert. This makes the sync idempotent for the upsert path
+        // (update re-indexes the row instead of leaving a stale/duplicated entry).
+        using (var del = _conn.CreateCommand())
+        {
+            del.CommandText = "DELETE FROM observations_fts WHERE rowid = $id";
+            del.Parameters.AddWithValue("$id", id);
+            del.ExecuteNonQuery();
+        }
         using var cmd = _conn.CreateCommand();
         cmd.CommandText = "INSERT INTO observations_fts(rowid, title, content, topic_key, type) SELECT id, title, content, topic_key, type FROM observations WHERE id = $id";
         cmd.Parameters.AddWithValue("$id", id);

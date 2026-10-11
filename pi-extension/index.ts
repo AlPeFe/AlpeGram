@@ -81,19 +81,25 @@ export default function (pi: ExtensionAPI) {
 			),
 		}),
 		execute: async (_id, params, _signal, _onUpdate, ctx: ExtensionToolContext) => {
-			const obs = await api<{ id: number; title: string; topicKey?: string }>(
+			const res = await api<{ observation: { id: number; title: string; topicKey?: string }; created: boolean }>(
 				`/api/observations?${scope(ctx.cwd)}`,
 				{
 					method: "POST",
 					body: JSON.stringify(params),
 				},
 			);
-			ctx.ui.notify(`✓ Memoria guardada #${obs.id}: ${obs.title}${obs.topicKey ? ` [${obs.topicKey}]` : ""}`, "info");
+			const { observation: obs, created } = res;
+			ctx.ui.notify(
+				created
+					? `✓ Memoria guardada #${obs.id}: ${obs.title}${obs.topicKey ? ` [${obs.topicKey}]` : ""}`
+					: `✎ Memoria actualizada #${obs.id}: ${obs.title}${obs.topicKey ? ` [${obs.topicKey}]` : ""}`,
+				"info",
+			);
 			return {
 				content: [
 					{
 						type: "text",
-						text: `Saved observation #${obs.id}: ${obs.title}${obs.topicKey ? ` [topic: ${obs.topicKey}]` : ""}`,
+						text: `${created ? "Saved" : "Updated"} observation #${obs.id}: ${obs.title}${obs.topicKey ? ` [topic: ${obs.topicKey}]` : ""}`,
 					},
 				],
 				details: obs,
@@ -140,10 +146,17 @@ export default function (pi: ExtensionAPI) {
 		parameters: Type.Object({
 			query: Type.String({ description: "Search terms; all terms must match" }),
 			limit: Type.Optional(Type.Number({ description: "Max results (default 10)" })),
+			type: Type.Optional(Type.String({ description: "Filter by observation type (e.g. 'adr', 'decision', 'bugfix', 'pattern')" })),
+			topicKey: Type.Optional(Type.String({ description: "Restrict to a single topic key, e.g. 'ui/palette'" })),
 		}),
 		execute: async (_id, params, _signal, _onUpdate, ctx: ExtensionToolContext) => {
 			const hits = await api<Array<{ id: number; title: string; content: string; topicKey?: string; type?: string }>>(
-				`/api/search?${scope(ctx.cwd, { q: params.query, limit: String(params.limit ?? 10) })}`,
+				`/api/search?${scope(ctx.cwd, {
+					q: params.query,
+					limit: String(params.limit ?? 10),
+					...(params.type ? { type: params.type } : {}),
+					...(params.topicKey ? { topicKey: params.topicKey } : {}),
+				})}`,
 			);
 			if (hits.length === 0) {
 				return { content: [{ type: "text", text: "No memory matches." }], details: [] };
@@ -213,8 +226,8 @@ export default function (pi: ExtensionAPI) {
 		parameters: Type.Object({
 			id: Type.Number({ description: "Observation id" }),
 		}),
-		execute: async (_id, params, _signal, _onUpdate) => {
-			const obs = await api<Record<string, unknown>>(`/api/observations/${params.id}`);
+		execute: async (_id, params, _signal, _onUpdate, ctx: ExtensionToolContext) => {
+			const obs = await api<Record<string, unknown>>(`/api/observations/${params.id}?${scope(ctx.cwd)}`);
 			return { content: [{ type: "text", text: JSON.stringify(obs, null, 2) }], details: obs };
 		},
 	});
