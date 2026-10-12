@@ -65,7 +65,7 @@ export default function (pi: ExtensionAPI) {
 		name: "mem_save",
 		label: "HanniGram: save memory",
 		description:
-			"Save a durable, structured memory observation for the current project. Use for completed bug fixes, decisions, discoveries, config changes, patterns, and durable user constraints. Do NOT capture raw tool output or every conversational turn. Provide a short searchable title and a fitting type.",
+			"Save a durable, structured memory observation for the CURRENT project (scoped by git remote). Two kinds of memory, both per-project: (1) decisions & conventions the agent must RESPECT — set type='adr' so they are always surfaced to the agent; (2) context/ideas in progress — discoveries, patterns, bugfixes, config, concepts being worked on (any other type). Capture durable knowledge, never raw tool output or every turn. Give a short searchable title.",
 		parameters: Type.Object({
 			title: Type.String({ description: "Short, searchable title of the observation" }),
 			content: Type.String({ description: "The full observation content" }),
@@ -77,7 +77,7 @@ export default function (pi: ExtensionAPI) {
 				Type.String({ description: "Stable topic key, e.g. 'architecture/auth-model'. Reuse to update an evolving topic." }),
 			),
 			type: Type.Optional(
-				Type.String({ description: "Observation type, e.g. 'discovery', 'decision', 'bugfix', 'pattern', 'constraint'" }),
+				Type.String({ description: "Observation type. Two buckets per project: 'adr' = decision/convention the agent must respect (always surfaced); anything else ('discovery', 'idea', 'pattern', 'bugfix', ...) = context/idea being worked on." }),
 			),
 		}),
 		execute: async (_id, params, _signal, _onUpdate, ctx: ExtensionToolContext) => {

@@ -12,6 +12,11 @@ public sealed class HanniGramStore : IDisposable
 {
     private readonly string _dbPath;
     private readonly SqliteConnection _conn;
+    // Serialize access to the single shared connection. Microsoft.Data.Sqlite does
+    // NOT allow concurrent commands on one SqliteConnection (two overlapping
+    // commands throw "Index was out of range" in RemoveCommand under load). lock{}
+    // is reentrant, so a public method calling another public method is still safe.
+    private readonly object _gate = new();
 
     public HanniGramStore(string? dbPath = null)
     {
@@ -26,8 +31,25 @@ public sealed class HanniGramStore : IDisposable
         Initialize();
     }
 
+    // Bump when the FTS tokenizer or an indexed schema changes, to force a one-off
+    // re-index. Do NOT bump on every open — that re-indexed the whole corpus per start.
+    private const int SchemaVersion = 1;
+
     private void Initialize()
     {
+        // Connection pragmas, set once per open:
+        //  - WAL: lets the daemon (single writer) coexist with the CLI and the
+        //    harness's read-only node:sqlite readers without SQLITE_BUSY.
+        //  - busy_timeout: wait instead of throwing when another writer holds the lock.
+        //  - foreign_keys: enforce the ON DELETE CASCADE clauses (OFF by default in SQLite).
+        // These pragmas return a value, so they must be run with ExecuteScalar (not
+        // ExecuteNonQuery): leaving the result row unconsumed leaves the statement
+        // half-finalized and later writes report "database disk image is malformed".
+        Pragma("PRAGMA journal_mode=WAL;");
+        Pragma("PRAGMA synchronous=NORMAL;");
+        Pragma("PRAGMA busy_timeout=5000;");
+        Pragma("PRAGMA foreign_keys=ON;");
+
         Exec(@"
             CREATE TABLE IF NOT EXISTS projects (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -58,18 +80,31 @@ public sealed class HanniGramStore : IDisposable
             CREATE INDEX IF NOT EXISTS idx_obs_project ON observations(project_id);
             CREATE INDEX IF NOT EXISTS idx_obs_topic ON observations(project_id, topic_key);
             CREATE INDEX IF NOT EXISTS idx_sess_project ON sessions(project_id);
-            -- FTS5 with trigram tokenizer: typo-tolerant and substring/CJK search.
-            -- Drop+recreate forces the new tokenizer on existing DBs (external-content
-            -- safe: observations rows are untouched; 'rebuild' below re-indexes them).
-            DROP TABLE IF EXISTS observations_fts;
-            CREATE VIRTUAL TABLE observations_fts USING fts5(
-                title, content, topic_key, type,
-                tokenize='trigram',
-                content='observations', content_rowid='id'
-            );
         ");
-        // Rebuild FTS if the external-content table is out of sync (e.g. after schema change).
-        Exec("INSERT INTO observations_fts(observations_fts) VALUES('rebuild');");
+
+        // FTS5 trigram index: typo-tolerant and substring/CJK search. Built/patched ONLY
+        // when the schema version advances, not on every open. The drop+recreate is
+        // external-content safe (observations rows are untouched; 'rebuild' re-indexes).
+        if (GetUserVersion() < SchemaVersion)
+        {
+            Exec("DROP TABLE IF EXISTS observations_fts;");
+            Exec(@"
+                CREATE VIRTUAL TABLE observations_fts USING fts5(
+                    title, content, topic_key, type,
+                    tokenize='trigram',
+                    content='observations', content_rowid='id'
+                );
+            ");
+            Exec("INSERT INTO observations_fts(observations_fts) VALUES('rebuild');");
+            Exec($"PRAGMA user_version={SchemaVersion};");
+        }
+    }
+
+    private int GetUserVersion()
+    {
+        using var cmd = _conn.CreateCommand();
+        cmd.CommandText = "PRAGMA user_version;";
+        return Convert.ToInt32(cmd.ExecuteScalar());
     }
 
     // =====================================================================
@@ -78,49 +113,58 @@ public sealed class HanniGramStore : IDisposable
 
     public Project? GetProjectByName(string name)
     {
-        using var cmd = _conn.CreateCommand();
-        cmd.CommandText = "SELECT id, name, root_path, created_at_utc, updated_at_utc FROM projects WHERE name = $n";
-        cmd.Parameters.AddWithValue("$n", name);
-        using var r = cmd.ExecuteReader();
-        return r.Read() ? ReadProject(r) : null;
+        lock (_gate)
+        {
+            using var cmd = _conn.CreateCommand();
+            cmd.CommandText = "SELECT id, name, root_path, created_at_utc, updated_at_utc FROM projects WHERE name = $n";
+            cmd.Parameters.AddWithValue("$n", name);
+            using var r = cmd.ExecuteReader();
+            return r.Read() ? ReadProject(r) : null;
+        }
     }
 
     public Project GetOrCreateProject(string name, string? rootPath = null)
     {
-        var existing = GetProjectByName(name);
-        if (existing != null)
+        lock (_gate)
         {
-            if (rootPath != null && existing.RootPath != rootPath)
+            var existing = GetProjectByName(name);
+            if (existing != null)
             {
-                using var up = _conn.CreateCommand();
-                up.CommandText = "UPDATE projects SET root_path = $r, updated_at_utc = $u WHERE id = $id";
-                up.Parameters.AddWithValue("$r", rootPath);
-                up.Parameters.AddWithValue("$u", Now());
-                up.Parameters.AddWithValue("$id", existing.Id);
-                up.ExecuteNonQuery();
-                existing.RootPath = rootPath;
+                if (rootPath != null && existing.RootPath != rootPath)
+                {
+                    using var up = _conn.CreateCommand();
+                    up.CommandText = "UPDATE projects SET root_path = $r, updated_at_utc = $u WHERE id = $id";
+                    up.Parameters.AddWithValue("$r", rootPath);
+                    up.Parameters.AddWithValue("$u", Now());
+                    up.Parameters.AddWithValue("$id", existing.Id);
+                    up.ExecuteNonQuery();
+                    existing.RootPath = rootPath;
+                }
+                return existing;
             }
-            return existing;
-        }
 
-        using var cmd = _conn.CreateCommand();
-        cmd.CommandText = "INSERT INTO projects (name, root_path, created_at_utc, updated_at_utc) VALUES ($n, $r, $c, $u); SELECT last_insert_rowid();";
-        cmd.Parameters.AddWithValue("$n", name);
-        cmd.Parameters.AddWithValue("$r", (object?)rootPath ?? DBNull.Value);
-        cmd.Parameters.AddWithValue("$c", Now());
-        cmd.Parameters.AddWithValue("$u", Now());
-        var id = (long)cmd.ExecuteScalar()!;
-        return new Project { Id = id, Name = name, RootPath = rootPath, CreatedAtUtc = DateTime.UtcNow, UpdatedAtUtc = DateTime.UtcNow };
+            using var cmd = _conn.CreateCommand();
+            cmd.CommandText = "INSERT INTO projects (name, root_path, created_at_utc, updated_at_utc) VALUES ($n, $r, $c, $u); SELECT last_insert_rowid();";
+            cmd.Parameters.AddWithValue("$n", name);
+            cmd.Parameters.AddWithValue("$r", (object?)rootPath ?? DBNull.Value);
+            cmd.Parameters.AddWithValue("$c", Now());
+            cmd.Parameters.AddWithValue("$u", Now());
+            var id = (long)cmd.ExecuteScalar()!;
+            return new Project { Id = id, Name = name, RootPath = rootPath, CreatedAtUtc = DateTime.UtcNow, UpdatedAtUtc = DateTime.UtcNow };
+        }
     }
 
     public IReadOnlyList<Project> ListProjects()
     {
-        var list = new List<Project>();
-        using var cmd = _conn.CreateCommand();
-        cmd.CommandText = "SELECT id, name, root_path, created_at_utc, updated_at_utc FROM projects ORDER BY name";
-        using var r = cmd.ExecuteReader();
-        while (r.Read()) list.Add(ReadProject(r));
-        return list;
+        lock (_gate)
+        {
+            var list = new List<Project>();
+            using var cmd = _conn.CreateCommand();
+            cmd.CommandText = "SELECT id, name, root_path, created_at_utc, updated_at_utc FROM projects ORDER BY name";
+            using var r = cmd.ExecuteReader();
+            while (r.Read()) list.Add(ReadProject(r));
+            return list;
+        }
     }
 
     // =====================================================================
@@ -139,49 +183,52 @@ public sealed class HanniGramStore : IDisposable
         string? what = null, string? why = null, string? where = null, string? learned = null,
         string? topicKey = null, string? type = null)
     {
-        var existing = string.IsNullOrEmpty(topicKey) ? null : FindLatestByTopicKey(projectId, topicKey);
-        long id;
-        var created = existing is null;
-        if (created)
+        lock (_gate)
         {
-            using var cmd = _conn.CreateCommand();
-            cmd.CommandText = @"
-                INSERT INTO observations (project_id, title, content, what, why, where_, learned, topic_key, type, created_at_utc, updated_at_utc)
-                VALUES ($p, $t, $c, $w, $y, $wh, $l, $tk, $ty, $n, $n);
-                SELECT last_insert_rowid();";
-            cmd.Parameters.AddWithValue("$p", projectId);
-            cmd.Parameters.AddWithValue("$t", title);
-            cmd.Parameters.AddWithValue("$c", content);
-            cmd.Parameters.AddWithValue("$w", (object?)what ?? DBNull.Value);
-            cmd.Parameters.AddWithValue("$y", (object?)why ?? DBNull.Value);
-            cmd.Parameters.AddWithValue("$wh", (object?)where ?? DBNull.Value);
-            cmd.Parameters.AddWithValue("$l", (object?)learned ?? DBNull.Value);
-            cmd.Parameters.AddWithValue("$tk", (object?)topicKey ?? DBNull.Value);
-            cmd.Parameters.AddWithValue("$ty", (object?)type ?? DBNull.Value);
-            cmd.Parameters.AddWithValue("$n", Now());
-            id = (long)cmd.ExecuteScalar()!;
+            var existing = string.IsNullOrEmpty(topicKey) ? null : FindLatestByTopicKey(projectId, topicKey);
+            long id;
+            var created = existing is null;
+            if (created)
+            {
+                using var cmd = _conn.CreateCommand();
+                cmd.CommandText = @"
+                    INSERT INTO observations (project_id, title, content, what, why, where_, learned, topic_key, type, created_at_utc, updated_at_utc)
+                    VALUES ($p, $t, $c, $w, $y, $wh, $l, $tk, $ty, $n, $n);
+                    SELECT last_insert_rowid();";
+                cmd.Parameters.AddWithValue("$p", projectId);
+                cmd.Parameters.AddWithValue("$t", title);
+                cmd.Parameters.AddWithValue("$c", content);
+                cmd.Parameters.AddWithValue("$w", (object?)what ?? DBNull.Value);
+                cmd.Parameters.AddWithValue("$y", (object?)why ?? DBNull.Value);
+                cmd.Parameters.AddWithValue("$wh", (object?)where ?? DBNull.Value);
+                cmd.Parameters.AddWithValue("$l", (object?)learned ?? DBNull.Value);
+                cmd.Parameters.AddWithValue("$tk", (object?)topicKey ?? DBNull.Value);
+                cmd.Parameters.AddWithValue("$ty", (object?)type ?? DBNull.Value);
+                cmd.Parameters.AddWithValue("$n", Now());
+                id = (long)cmd.ExecuteScalar()!;
+            }
+            else
+            {
+                id = existing!.Id;
+                using var cmd = _conn.CreateCommand();
+                cmd.CommandText = @"
+                    UPDATE observations
+                    SET title = $t, content = $c, what = $w, why = $y, where_ = $wh, learned = $l, type = $ty, updated_at_utc = $n
+                    WHERE id = $id";
+                cmd.Parameters.AddWithValue("$t", title);
+                cmd.Parameters.AddWithValue("$c", content);
+                cmd.Parameters.AddWithValue("$w", (object?)what ?? DBNull.Value);
+                cmd.Parameters.AddWithValue("$y", (object?)why ?? DBNull.Value);
+                cmd.Parameters.AddWithValue("$wh", (object?)where ?? DBNull.Value);
+                cmd.Parameters.AddWithValue("$l", (object?)learned ?? DBNull.Value);
+                cmd.Parameters.AddWithValue("$ty", (object?)type ?? DBNull.Value);
+                cmd.Parameters.AddWithValue("$n", Now());
+                cmd.Parameters.AddWithValue("$id", id);
+                cmd.ExecuteNonQuery();
+            }
+            RebuildFts();
+            return (GetObservation(projectId, id)!, created);
         }
-        else
-        {
-            id = existing!.Id;
-            using var cmd = _conn.CreateCommand();
-            cmd.CommandText = @"
-                UPDATE observations
-                SET title = $t, content = $c, what = $w, why = $y, where_ = $wh, learned = $l, type = $ty, updated_at_utc = $n
-                WHERE id = $id";
-            cmd.Parameters.AddWithValue("$t", title);
-            cmd.Parameters.AddWithValue("$c", content);
-            cmd.Parameters.AddWithValue("$w", (object?)what ?? DBNull.Value);
-            cmd.Parameters.AddWithValue("$y", (object?)why ?? DBNull.Value);
-            cmd.Parameters.AddWithValue("$wh", (object?)where ?? DBNull.Value);
-            cmd.Parameters.AddWithValue("$l", (object?)learned ?? DBNull.Value);
-            cmd.Parameters.AddWithValue("$ty", (object?)type ?? DBNull.Value);
-            cmd.Parameters.AddWithValue("$n", Now());
-            cmd.Parameters.AddWithValue("$id", id);
-            cmd.ExecuteNonQuery();
-        }
-        SyncFtsRow(id);
-        return (GetObservation(projectId, id)!, created);
     }
 
     private Observation? FindLatestByTopicKey(long projectId, string topicKey)
@@ -194,70 +241,83 @@ public sealed class HanniGramStore : IDisposable
         return r.Read() ? ReadObservation(r) : null;
     }
 
-	public Observation? GetObservation(long projectId, long id)
-	{
-		using var cmd = _conn.CreateCommand();
-		cmd.CommandText = "SELECT id, project_id, title, content, what, why, where_, learned, topic_key, type, created_at_utc, updated_at_utc FROM observations WHERE id = $id AND project_id = $p";
-		cmd.Parameters.AddWithValue("$id", id);
-		cmd.Parameters.AddWithValue("$p", projectId);
-		using var r = cmd.ExecuteReader();
-		return r.Read() ? ReadObservation(r) : null;
-	}
+    public Observation? GetObservation(long projectId, long id)
+    {
+        lock (_gate)
+        {
+            using var cmd = _conn.CreateCommand();
+            cmd.CommandText = "SELECT id, project_id, title, content, what, why, where_, learned, topic_key, type, created_at_utc, updated_at_utc FROM observations WHERE id = $id AND project_id = $p";
+            cmd.Parameters.AddWithValue("$id", id);
+            cmd.Parameters.AddWithValue("$p", projectId);
+            using var r = cmd.ExecuteReader();
+            return r.Read() ? ReadObservation(r) : null;
+        }
+    }
 
-	/// <summary>Delete an observation (scoped to a project) and its FTS row. Returns true if it existed.</summary>
-	public bool DeleteObservation(long projectId, long id)
-	{
-		using var cmd = _conn.CreateCommand();
-		cmd.CommandText = "DELETE FROM observations WHERE id = $id AND project_id = $p";
-		cmd.Parameters.AddWithValue("$id", id);
-		cmd.Parameters.AddWithValue("$p", projectId);
-		var deleted = cmd.ExecuteNonQuery() > 0;
-		if (deleted)
-		{
-			using var fts = _conn.CreateCommand();
-			fts.CommandText = "DELETE FROM observations_fts WHERE rowid = $id";
-			fts.Parameters.AddWithValue("$id", id);
-			fts.ExecuteNonQuery();
-		}
-		return deleted;
-	}
+    /// <summary>Delete an observation (scoped to a project). Returns true if it existed.</summary>
+    public bool DeleteObservation(long projectId, long id)
+    {
+        lock (_gate)
+        {
+            using var cmd = _conn.CreateCommand();
+            cmd.CommandText = "DELETE FROM observations WHERE id = $id AND project_id = $p";
+            cmd.Parameters.AddWithValue("$id", id);
+            cmd.Parameters.AddWithValue("$p", projectId);
+            var deleted = cmd.ExecuteNonQuery() > 0;
+            if (deleted)
+            {
+                // Re-index (the removed row drops out of the external-content index).
+                RebuildFts();
+            }
+            return deleted;
+        }
+    }
 
     public IReadOnlyList<Observation> ListObservations(long projectId, int limit = 50)
     {
-        var list = new List<Observation>();
-        using var cmd = _conn.CreateCommand();
-        cmd.CommandText = "SELECT id, project_id, title, content, what, why, where_, learned, topic_key, type, created_at_utc, updated_at_utc FROM observations WHERE project_id = $p ORDER BY created_at_utc DESC LIMIT $l";
-        cmd.Parameters.AddWithValue("$p", projectId);
-        cmd.Parameters.AddWithValue("$l", limit);
-        using var r = cmd.ExecuteReader();
-        while (r.Read()) list.Add(ReadObservation(r));
-        return list;
+        lock (_gate)
+        {
+            var list = new List<Observation>();
+            using var cmd = _conn.CreateCommand();
+            cmd.CommandText = "SELECT id, project_id, title, content, what, why, where_, learned, topic_key, type, created_at_utc, updated_at_utc FROM observations WHERE project_id = $p ORDER BY created_at_utc DESC LIMIT $l";
+            cmd.Parameters.AddWithValue("$p", projectId);
+            cmd.Parameters.AddWithValue("$l", limit);
+            using var r = cmd.ExecuteReader();
+            while (r.Read()) list.Add(ReadObservation(r));
+            return list;
+        }
     }
 
     public IReadOnlyList<Observation> GetByTopicKey(long projectId, string topicKey)
     {
-        var list = new List<Observation>();
-        using var cmd = _conn.CreateCommand();
-        cmd.CommandText = "SELECT id, project_id, title, content, what, why, where_, learned, topic_key, type, created_at_utc, updated_at_utc FROM observations WHERE project_id = $p AND topic_key = $tk ORDER BY created_at_utc DESC";
-        cmd.Parameters.AddWithValue("$p", projectId);
-        cmd.Parameters.AddWithValue("$tk", topicKey);
-        using var r = cmd.ExecuteReader();
-        while (r.Read()) list.Add(ReadObservation(r));
-        return list;
+        lock (_gate)
+        {
+            var list = new List<Observation>();
+            using var cmd = _conn.CreateCommand();
+            cmd.CommandText = "SELECT id, project_id, title, content, what, why, where_, learned, topic_key, type, created_at_utc, updated_at_utc FROM observations WHERE project_id = $p AND topic_key = $tk ORDER BY created_at_utc DESC";
+            cmd.Parameters.AddWithValue("$p", projectId);
+            cmd.Parameters.AddWithValue("$tk", topicKey);
+            using var r = cmd.ExecuteReader();
+            while (r.Read()) list.Add(ReadObservation(r));
+            return list;
+        }
     }
 
     public IReadOnlyList<SearchHit> Search(long projectId, string query, int limit = 10, string? type = null, string? topicKey = null)
     {
-        var hits = SearchCore(projectId, FtsQuery(query), limit, type, topicKey);
-        // Trigram tokenizer matches substrings, not fuzzy typos. When a strict
-        // AND match finds nothing, retry with OR of the query's trigrams so a
-        // typo'd word (1-3 chars off in a long word) still matches documents
-        // sharing enough trigrams, ranked by bm25.
-        if (hits.Count == 0 && query.Where(char.IsLetterOrDigit).Count() >= 6)
+        lock (_gate)
         {
-            hits = SearchCore(projectId, FtsTrigramFallback(query), limit, type, topicKey);
+            var hits = SearchCore(projectId, FtsQuery(query), limit, type, topicKey);
+            // Trigram tokenizer matches substrings, not fuzzy typos. When a strict
+            // AND match finds nothing, retry with OR of the query's trigrams so a
+            // typo'd word (1-3 chars off in a long word) still matches documents
+            // sharing enough trigrams, ranked by bm25.
+            if (hits.Count == 0 && query.Where(char.IsLetterOrDigit).Count() >= 6)
+            {
+                hits = SearchCore(projectId, FtsTrigramFallback(query), limit, type, topicKey);
+            }
+            return hits;
         }
-        return hits;
     }
 
     private List<SearchHit> SearchCore(long projectId, string ftsQuery, int limit, string? type = null, string? topicKey = null)
@@ -297,14 +357,17 @@ public sealed class HanniGramStore : IDisposable
 
     public IReadOnlyList<string> SuggestTopicKeys(long projectId, int limit = 20)
     {
-        var list = new List<string>();
-        using var cmd = _conn.CreateCommand();
-        cmd.CommandText = "SELECT DISTINCT topic_key FROM observations WHERE project_id = $p AND topic_key IS NOT NULL ORDER BY topic_key LIMIT $l";
-        cmd.Parameters.AddWithValue("$p", projectId);
-        cmd.Parameters.AddWithValue("$l", limit);
-        using var r = cmd.ExecuteReader();
-        while (r.Read()) list.Add(r.GetString(0));
-        return list;
+        lock (_gate)
+        {
+            var list = new List<string>();
+            using var cmd = _conn.CreateCommand();
+            cmd.CommandText = "SELECT DISTINCT topic_key FROM observations WHERE project_id = $p AND topic_key IS NOT NULL ORDER BY topic_key LIMIT $l";
+            cmd.Parameters.AddWithValue("$p", projectId);
+            cmd.Parameters.AddWithValue("$l", limit);
+            using var r = cmd.ExecuteReader();
+            while (r.Read()) list.Add(r.GetString(0));
+            return list;
+        }
     }
 
     // =====================================================================
@@ -313,71 +376,77 @@ public sealed class HanniGramStore : IDisposable
 
     public Session StartSession(long projectId, string sessionId)
     {
-        using var cmd = _conn.CreateCommand();
-        cmd.CommandText = "INSERT INTO sessions (project_id, session_id, started_at_utc) VALUES ($p, $s, $n); SELECT last_insert_rowid();";
-        cmd.Parameters.AddWithValue("$p", projectId);
-        cmd.Parameters.AddWithValue("$s", sessionId);
-        cmd.Parameters.AddWithValue("$n", Now());
-        var id = (long)cmd.ExecuteScalar()!;
-        return new Session { Id = id, ProjectId = projectId, SessionId = sessionId, StartedAtUtc = DateTime.UtcNow };
+        lock (_gate)
+        {
+            using var cmd = _conn.CreateCommand();
+            cmd.CommandText = "INSERT INTO sessions (project_id, session_id, started_at_utc) VALUES ($p, $s, $n); SELECT last_insert_rowid();";
+            cmd.Parameters.AddWithValue("$p", projectId);
+            cmd.Parameters.AddWithValue("$s", sessionId);
+            cmd.Parameters.AddWithValue("$n", Now());
+            var id = (long)cmd.ExecuteScalar()!;
+            return new Session { Id = id, ProjectId = projectId, SessionId = sessionId, StartedAtUtc = DateTime.UtcNow };
+        }
     }
 
     public void EndSession(long projectId, string sessionId, string? summary, string? goal, string? nextSteps)
     {
-        using var cmd = _conn.CreateCommand();
-        cmd.CommandText = "UPDATE sessions SET ended_at_utc = $e, summary = $s, goal = $g, next_steps = $n WHERE project_id = $p AND session_id = $sid";
-        cmd.Parameters.AddWithValue("$e", Now());
-        cmd.Parameters.AddWithValue("$s", (object?)summary ?? DBNull.Value);
-        cmd.Parameters.AddWithValue("$g", (object?)goal ?? DBNull.Value);
-        cmd.Parameters.AddWithValue("$n", (object?)nextSteps ?? DBNull.Value);
-        cmd.Parameters.AddWithValue("$p", projectId);
-        cmd.Parameters.AddWithValue("$sid", sessionId);
-        cmd.ExecuteNonQuery();
+        lock (_gate)
+        {
+            using var cmd = _conn.CreateCommand();
+            cmd.CommandText = "UPDATE sessions SET ended_at_utc = $e, summary = $s, goal = $g, next_steps = $n WHERE project_id = $p AND session_id = $sid";
+            cmd.Parameters.AddWithValue("$e", Now());
+            cmd.Parameters.AddWithValue("$s", (object?)summary ?? DBNull.Value);
+            cmd.Parameters.AddWithValue("$g", (object?)goal ?? DBNull.Value);
+            cmd.Parameters.AddWithValue("$n", (object?)nextSteps ?? DBNull.Value);
+            cmd.Parameters.AddWithValue("$p", projectId);
+            cmd.Parameters.AddWithValue("$sid", sessionId);
+            cmd.ExecuteNonQuery();
+        }
     }
 
     public IReadOnlyList<Session> ListSessions(long projectId, int limit = 20)
     {
-        var list = new List<Session>();
-        using var cmd = _conn.CreateCommand();
-        cmd.CommandText = "SELECT id, project_id, session_id, started_at_utc, ended_at_utc, summary, goal, next_steps FROM sessions WHERE project_id = $p ORDER BY started_at_utc DESC LIMIT $l";
-        cmd.Parameters.AddWithValue("$p", projectId);
-        cmd.Parameters.AddWithValue("$l", limit);
-        using var r = cmd.ExecuteReader();
-        while (r.Read())
+        lock (_gate)
         {
-            list.Add(new Session
+            var list = new List<Session>();
+            using var cmd = _conn.CreateCommand();
+            cmd.CommandText = "SELECT id, project_id, session_id, started_at_utc, ended_at_utc, summary, goal, next_steps FROM sessions WHERE project_id = $p ORDER BY started_at_utc DESC LIMIT $l";
+            cmd.Parameters.AddWithValue("$p", projectId);
+            cmd.Parameters.AddWithValue("$l", limit);
+            using var r = cmd.ExecuteReader();
+            while (r.Read())
             {
-                Id = r.GetInt64(0),
-                ProjectId = r.GetInt64(1),
-                SessionId = r.GetString(2),
-                StartedAtUtc = DateTime.Parse(r.GetString(3), null, System.Globalization.DateTimeStyles.RoundtripKind),
-                EndedAtUtc = r.IsDBNull(4) ? null : DateTime.Parse(r.GetString(4), null, System.Globalization.DateTimeStyles.RoundtripKind),
-                Summary = r.IsDBNull(5) ? null : r.GetString(5),
-                Goal = r.IsDBNull(6) ? null : r.GetString(6),
-                NextSteps = r.IsDBNull(7) ? null : r.GetString(7),
-            });
+                list.Add(new Session
+                {
+                    Id = r.GetInt64(0),
+                    ProjectId = r.GetInt64(1),
+                    SessionId = r.GetString(2),
+                    StartedAtUtc = DateTime.Parse(r.GetString(3), null, System.Globalization.DateTimeStyles.RoundtripKind),
+                    EndedAtUtc = r.IsDBNull(4) ? null : DateTime.Parse(r.GetString(4), null, System.Globalization.DateTimeStyles.RoundtripKind),
+                    Summary = r.IsDBNull(5) ? null : r.GetString(5),
+                    Goal = r.IsDBNull(6) ? null : r.GetString(6),
+                    NextSteps = r.IsDBNull(7) ? null : r.GetString(7),
+                });
+            }
+            return list;
         }
-        return list;
     }
 
     // =====================================================================
     // Helpers
     // =====================================================================
 
-    private void SyncFtsRow(long id)
+    /// <summary>
+    /// Rebuild the FTS index from the content table. FTS5 EXTERNAL-CONTENT tables
+    /// must NOT be written directly: a manual INSERT/DELETE against observations_fts
+    /// corrupts the index ("database disk image is malformed" on the first write
+    /// after a rebuild). 'rebuild' is the canonical external-content sync — it is
+    /// O(N) but safe and fast at personal-memory scale.
+    /// </summary>
+    private void RebuildFts()
     {
-        // External-content FTS5: delete any existing index entry for this rowid,
-        // then re-insert. This makes the sync idempotent for the upsert path
-        // (update re-indexes the row instead of leaving a stale/duplicated entry).
-        using (var del = _conn.CreateCommand())
-        {
-            del.CommandText = "DELETE FROM observations_fts WHERE rowid = $id";
-            del.Parameters.AddWithValue("$id", id);
-            del.ExecuteNonQuery();
-        }
         using var cmd = _conn.CreateCommand();
-        cmd.CommandText = "INSERT INTO observations_fts(rowid, title, content, topic_key, type) SELECT id, title, content, topic_key, type FROM observations WHERE id = $id";
-        cmd.Parameters.AddWithValue("$id", id);
+        cmd.CommandText = "INSERT INTO observations_fts(observations_fts) VALUES('rebuild');";
         cmd.ExecuteNonQuery();
     }
 
@@ -419,6 +488,14 @@ public sealed class HanniGramStore : IDisposable
         using var cmd = _conn.CreateCommand();
         cmd.CommandText = sql;
         cmd.ExecuteNonQuery();
+    }
+
+    /// <summary>Run a value-returning PRAGMA, consuming its result row.</summary>
+    private void Pragma(string sql)
+    {
+        using var cmd = _conn.CreateCommand();
+        cmd.CommandText = sql;
+        cmd.ExecuteScalar();
     }
 
     private static Project ReadProject(SqliteDataReader r) => new()
