@@ -7,12 +7,26 @@
  *
  * The daemon resolves the project from the session cwd (git remote when
  * available), so memory is scoped per project automatically.
+ *
+ * HanniGram lives as long as Hanni: on load, and before every mem_* call, the
+ * extension ensures the daemon process is up (health check on /health; if the
+ * daemon is not reachable it spawns it detached). Override the daemon path with
+ * HANNIGRAM_DAEMON and the endpoint with HANNIGRAM_URL / HANNIGRAM_URLS.
  */
 
 import type { ExtensionAPI, ExtensionToolContext } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
+import { spawn } from "node:child_process";
+import * as path from "node:path";
+import * as fs from "node:fs";
+import { fileURLToPath } from "node:url";
 
 const DEFAULT_BASE = "http://127.0.0.1:8765";
+const DEFAULT_URLS = "http://127.0.0.1:8765";
+const HEALTH_TIMEOUT_MS = 400;
+const READY_POLL_MS = 500;
+const READY_POLLS = 20;
+const UP_CACHE_TTL_MS = 15_000;
 
 function baseUrl(): string {
 	return process.env.HANNIGRAM_URL ?? DEFAULT_BASE;
@@ -37,7 +51,78 @@ function scope(cwd: string, extra: Record<string, string> = {}): string {
 	return p.toString();
 }
 
+function healthUrl(): string {
+	return `${baseUrl()}/health`;
+}
+
+// Directory of this extension (loaded from source via jiti, so import.meta.url
+// points at the real checkout path).
+const extensionDir = fileURLToPath(new URL(".", import.meta.url));
+
+/** Resolve the HanniGram.Server executable (env override first, else dev checkout). */
+function daemonPath(): string | null {
+	const envBin = process.env.HANNIGRAM_DAEMON;
+	if (envBin) return fs.existsSync(envBin) ? envBin : null;
+	const root = path.resolve(extensionDir, "..");
+	const exeName = process.platform === "win32" ? "HanniGram.Server.exe" : "HanniGram.Server";
+	for (const cfg of ["Release", "Debug"]) {
+		const p = path.join(root, "src", "HanniGram.Server", "bin", cfg, "net10.0", exeName);
+		if (fs.existsSync(p)) return p;
+	}
+	return null;
+}
+
+/** True if the daemon answers /health. */
+function daemonUp(): Promise<boolean> {
+	const ctl = new AbortController();
+	const timer = setTimeout(() => ctl.abort(), HEALTH_TIMEOUT_MS);
+	return fetch(healthUrl(), { signal: ctl.signal })
+		.then((r) => r.ok)
+		.catch(() => false)
+		.finally(() => clearTimeout(timer));
+}
+
+/** Spawn the daemon detached so it survives this Hanni session. Returns true if spawned. */
+function startDaemon(): boolean {
+	const bin = daemonPath();
+	if (!bin) return false;
+	try {
+		const child = spawn(bin, ["--urls", process.env.HANNIGRAM_URLS ?? DEFAULT_URLS], {
+			detached: true,
+			stdio: "ignore",
+			windowsHide: true,
+		});
+		child.unref();
+		return true;
+	} catch {
+		return false;
+	}
+}
+
+let lastUpAt = 0;
+
+/** Ensure the daemon is reachable, starting it if not. Cheap when already up. */
+async function ensureDaemon(): Promise<void> {
+	if (Date.now() - lastUpAt < UP_CACHE_TTL_MS) return;
+	if (await daemonUp()) {
+		lastUpAt = Date.now();
+		return;
+	}
+	if (startDaemon()) {
+		for (let i = 0; i < READY_POLLS; i++) {
+			if (await daemonUp()) {
+				lastUpAt = Date.now();
+				return;
+			}
+			await new Promise((r) => setTimeout(r, READY_POLL_MS));
+		}
+	}
+}
+
 export default function (pi: ExtensionAPI) {
+	// Hanni owns HanniGram: bring the daemon up as soon as the extension loads.
+	void ensureDaemon();
+
 	// ------------------------------------------------------------------
 	// mem_current_project — confirm the resolved project
 	// ------------------------------------------------------------------
@@ -48,6 +133,7 @@ export default function (pi: ExtensionAPI) {
 			"Confirm the HanniGram project resolved for the current working directory (git remote when available). Call this first to orient before reading or writing memory.",
 		parameters: Type.Object({}),
 		execute: async (_id, _params, _signal, _onUpdate, ctx: ExtensionToolContext) => {
+			await ensureDaemon();
 			const p = await api<{ id: number; name: string; rootPath?: string }>(
 				`/api/projects/current?${scope(ctx.cwd)}`,
 			);
@@ -81,6 +167,7 @@ export default function (pi: ExtensionAPI) {
 			),
 		}),
 		execute: async (_id, params, _signal, _onUpdate, ctx: ExtensionToolContext) => {
+			await ensureDaemon();
 			const res = await api<{ observation: { id: number; title: string; topicKey?: string }; created: boolean }>(
 				`/api/observations?${scope(ctx.cwd)}`,
 				{
@@ -119,6 +206,7 @@ export default function (pi: ExtensionAPI) {
 			id: Type.Number({ description: "Observation id to delete" }),
 		}),
 		execute: async (_id, params, _signal, _onUpdate, ctx: ExtensionToolContext) => {
+			await ensureDaemon();
 			const res = await fetch(`${baseUrl()}/api/observations/${params.id}?${scope(ctx.cwd)}`, {
 				method: "DELETE",
 			});
@@ -150,6 +238,7 @@ export default function (pi: ExtensionAPI) {
 			topicKey: Type.Optional(Type.String({ description: "Restrict to a single topic key, e.g. 'ui/palette'" })),
 		}),
 		execute: async (_id, params, _signal, _onUpdate, ctx: ExtensionToolContext) => {
+			await ensureDaemon();
 			const hits = await api<Array<{ id: number; title: string; content: string; topicKey?: string; type?: string }>>(
 				`/api/search?${scope(ctx.cwd, {
 					q: params.query,
@@ -180,6 +269,7 @@ export default function (pi: ExtensionAPI) {
 			limit: Type.Optional(Type.Number({ description: "Max observations (default 20)" })),
 		}),
 		execute: async (_id, params, _signal, _onUpdate, ctx: ExtensionToolContext) => {
+			await ensureDaemon();
 			const obs = await api<Array<{ id: number; title: string; content: string; topicKey?: string; type?: string }>>(
 				`/api/observations?${scope(ctx.cwd, { limit: String(params.limit ?? 20) })}`,
 			);
@@ -205,6 +295,7 @@ export default function (pi: ExtensionAPI) {
 			topicKey: Type.String({ description: "The topic key to retrieve, e.g. 'architecture/auth-model'" }),
 		}),
 		execute: async (_id, params, _signal, _onUpdate, ctx: ExtensionToolContext) => {
+			await ensureDaemon();
 			const obs = await api<Array<{ id: number; title: string; content: string; topicKey?: string }>>(
 				`/api/observations/topic/${encodeURIComponent(params.topicKey)}?${scope(ctx.cwd)}`,
 			);
@@ -227,6 +318,7 @@ export default function (pi: ExtensionAPI) {
 			id: Type.Number({ description: "Observation id" }),
 		}),
 		execute: async (_id, params, _signal, _onUpdate, ctx: ExtensionToolContext) => {
+			await ensureDaemon();
 			const obs = await api<Record<string, unknown>>(`/api/observations/${params.id}?${scope(ctx.cwd)}`);
 			return { content: [{ type: "text", text: JSON.stringify(obs, null, 2) }], details: obs };
 		},
@@ -242,6 +334,7 @@ export default function (pi: ExtensionAPI) {
 			"List existing topic keys in the current project. Use when unsure of the stable topic_key to reuse for an evolving topic.",
 		parameters: Type.Object({}),
 		execute: async (_id, _params, _signal, _onUpdate, ctx: ExtensionToolContext) => {
+			await ensureDaemon();
 			const topics = await api<string[]>(`/api/topics?${scope(ctx.cwd)}`);
 			if (topics.length === 0) {
 				return { content: [{ type: "text", text: "No topic keys yet." }], details: [] };
@@ -265,6 +358,7 @@ export default function (pi: ExtensionAPI) {
 			sessionId: Type.Optional(Type.String({ description: "Session id; a new one is created if omitted" })),
 		}),
 		execute: async (_id, params, _signal, _onUpdate, ctx: ExtensionToolContext) => {
+			await ensureDaemon();
 			const sessionId = params.sessionId ?? `pi-${Date.now().toString(36)}`;
 			await api(`/api/sessions/start?${scope(ctx.cwd)}`, {
 				method: "POST",
