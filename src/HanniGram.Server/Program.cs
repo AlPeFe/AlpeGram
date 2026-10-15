@@ -1,5 +1,6 @@
 using System.Text.Json;
 using System.Text.Json.Serialization;
+using HanniGram.Core;
 using HanniGram.Core.Models;
 using HanniGram.Core.Store;
 using Microsoft.AspNetCore.Diagnostics;
@@ -59,6 +60,17 @@ Project ResolveProject(HttpRequest req)
     return store.GetOrCreateProject(name, string.IsNullOrEmpty(cwd) ? null : cwd);
 }
 
+// The global namespace is shared by every project. Read paths look it up
+// WITHOUT creating it, so a project that never wrote global memory does not
+// spawn the sentinel; only writes create it. Returns null when no global
+// memory exists yet.
+long? GlobalProjectIdOrNull() => store.GetGlobalProject()?.Id;
+
+// The project id a single-scope read should target. "project" resolves and (as
+// before) creates the caller's own project; "global" only reads the sentinel.
+long? ScopeReadProjectId(HttpRequest req, string scope) =>
+    scope == MemoryScopes.Global ? GlobalProjectIdOrNull() : ResolveProject(req).Id;
+
 // ---- Health ----
 app.MapGet("/health", () => Results.Json(new { status = "ok", db = dbPath }, json));
 
@@ -74,11 +86,18 @@ app.MapGet("/api/projects/current", (HttpRequest req) =>
 // ---- Observations ----
 app.MapPost("/api/observations", (HttpRequest req, ObservationBody body) =>
 {
-    var p = ResolveProject(req);
+    // A memory is written to a scope explicitly. "project" (the default) uses
+    // the caller's own namespace; "global" uses the shared sentinel and creates
+    // it on first write.
+    var scope = MemoryScopes.ResolveScope(body.Scope, MemoryScopes.Project);
+    var projectId = scope == MemoryScopes.Global
+        ? store.GetOrCreateGlobalProject().Id
+        : ResolveProject(req).Id;
+
     var (obs, created) = store.SaveObservation(
-        p.Id, body.Title, body.Content ?? "",
+        projectId, body.Title, body.Content ?? "",
         body.What, body.Why, body.Where, body.Learned, body.TopicKey, body.Type);
-    return Results.Json(new { observation = obs, created }, json);
+    return Results.Json(new { observation = obs, created, scope }, json);
 });
 
 app.MapGet("/api/observations/{id:long}", (long id, HttpRequest req) =>
@@ -95,10 +114,13 @@ app.MapDelete("/api/observations/{id:long}", (long id, HttpRequest req) =>
     return deleted ? Results.Ok(new { deleted = true, id }) : Results.NotFound();
 });
 
-app.MapGet("/api/observations", (HttpRequest req, int limit = 50) =>
+app.MapGet("/api/observations", (HttpRequest req, int limit = 50, string? scope = null) =>
 {
-    var p = ResolveProject(req);
-    return Results.Json(store.ListObservations(p.Id, limit), json);
+    var s = MemoryScopes.ResolveScope(scope, MemoryScopes.Project);
+    var projectId = ScopeReadProjectId(req, s);
+    return projectId is null
+        ? Results.Json(Array.Empty<Observation>(), json)
+        : Results.Json(store.ListObservations(projectId.Value, limit), json);
 });
 
 app.MapGet("/api/observations/topic/{topicKey}", (string topicKey, HttpRequest req) =>
@@ -108,10 +130,13 @@ app.MapGet("/api/observations/topic/{topicKey}", (string topicKey, HttpRequest r
 });
 
 // ---- Search (FTS5) ----
-app.MapGet("/api/search", (HttpRequest req, string q, int limit = 10, string? type = null, string? topicKey = null) =>
+app.MapGet("/api/search", (HttpRequest req, string q, int limit = 10, string? type = null, string? topicKey = null, string? scope = null) =>
 {
-    var p = ResolveProject(req);
-    return Results.Json(store.Search(p.Id, q, limit, type, topicKey), json);
+    var s = MemoryScopes.ResolveScope(scope, MemoryScopes.Project);
+    var projectId = ScopeReadProjectId(req, s);
+    return projectId is null
+        ? Results.Json(Array.Empty<SearchHit>(), json)
+        : Results.Json(store.Search(projectId.Value, q, limit, type, topicKey), json);
 });
 
 // ---- Topic keys ----
@@ -156,6 +181,8 @@ public sealed class ObservationBody
     public string? Learned { get; set; }
     public string? TopicKey { get; set; }
     public string? Type { get; set; }
+    /// <summary>Write scope: "project" (default) or "global".</summary>
+    public string? Scope { get; set; }
 }
 
 public sealed class SessionStartBody

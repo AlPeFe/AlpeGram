@@ -1,4 +1,5 @@
-﻿using HanniGram.Core.Cli;
+﻿using HanniGram.Core;
+using HanniGram.Core.Cli;
 using HanniGram.Core.Store;
 using static HanniGram.Core.Cli.CwdResolver;
 
@@ -6,8 +7,8 @@ using static HanniGram.Core.Cli.CwdResolver;
 // Usage:
 //   hannigram project [cwd]                 resolve project for a cwd
 //   hannigram init [--cwd]                  init project memory (BD + .hannigram/memory.md local export)
-//   hannigram save <title> [--content] [--what] [--why] [--where] [--learned] [--topic] [--type] [--project] [--cwd]
-//   hannigram search <query> [--limit] [--project] [--cwd]
+//   hannigram save <title> [--content] [--what] [--why] [--where] [--learned] [--topic] [--type] [--scope] [--project] [--cwd]
+//   hannigram search <query> [--limit] [--scope] [--project] [--cwd]
 //   hannigram list [--limit] [--project] [--cwd]
 //   hannigram topics [--project] [--cwd]
 //   hannigram session-start [--id] [--project] [--cwd]
@@ -76,21 +77,32 @@ try
         case "save":
         {
             var title = rest.FirstOrDefault(a => !a.StartsWith("--")) ?? throw new ArgumentException("title required");
-            var p = store.GetOrCreateProject(resolvedProject, cwd);
+            // --scope global writes to the shared sentinel namespace; the default
+            // project scope writes to the caller's own namespace.
+            var scope = MemoryScopes.ResolveScope(Flag(rest, "--scope"), MemoryScopes.Project);
+            var p = scope == MemoryScopes.Global
+                ? store.GetOrCreateGlobalProject()
+                : store.GetOrCreateProject(resolvedProject, cwd);
             var (obs, created) = store.SaveObservation(p.Id, title,
                 Flag(rest, "--content") ?? "",
                 Flag(rest, "--what"), Flag(rest, "--why"), Flag(rest, "--where"),
                 Flag(rest, "--learned"), Flag(rest, "--topic"), Flag(rest, "--type"));
-            Console.WriteLine($"{(created ? "saved" : "updated")} #{obs.Id} [{p.Name}] {obs.Title}");
+            Console.WriteLine($"{(created ? "saved" : "updated")} #{obs.Id} [{p.Name}] ({scope}) {obs.Title}");
             break;
         }
 
         case "search":
         {
             var q = rest.FirstOrDefault(a => !a.StartsWith("--")) ?? throw new ArgumentException("query required");
-            var p = store.GetOrCreateProject(resolvedProject, cwd);
+            var scope = MemoryScopes.ResolveScope(Flag(rest, "--scope"), MemoryScopes.Project);
             var limit = IntFlag(rest, "--limit", 10);
-            foreach (var hit in store.Search(p.Id, q, limit))
+            // A global search reads the sentinel WITHOUT creating it: no global
+            // memory yet means no hits, not an empty namespace worth inserting.
+            long? projectId = scope == MemoryScopes.Global
+                ? store.GetGlobalProject()?.Id
+                : store.GetOrCreateProject(resolvedProject, cwd).Id;
+            if (projectId is null) break;
+            foreach (var hit in store.Search(projectId.Value, q, limit))
                 Console.WriteLine($"[{hit.Rank:F2}] #{hit.Id} {hit.Title} — {Truncate(hit.Content, 80)}");
             break;
         }
@@ -157,13 +169,16 @@ static void Help() => Console.WriteLine("""
 
     Usage:
       hannigram project [cwd]
-      hannigram save <title> [--content] [--what] [--why] [--where] [--learned] [--topic] [--type] [--project] [--cwd]
-      hannigram search <query> [--limit] [--project] [--cwd]
+      hannigram save <title> [--content] [--what] [--why] [--where] [--learned] [--topic] [--type] [--scope project|global] [--project] [--cwd]
+      hannigram search <query> [--limit] [--scope project|global] [--project] [--cwd]
       hannigram list [--limit] [--project] [--cwd]
       hannigram topics [--project] [--cwd]
       hannigram session-start [--id] [--project] [--cwd]
       hannigram session-end <id> [--summary] [--goal] [--next] [--project] [--cwd]
       hannigram projects
+
+    Scope: --scope global reads/writes the shared cross-project memory; the
+    default project scope reads/writes the caller's own namespace.
 
     Env: HANNIGRAM_DB (db path), HANNIGRAM_CWD (default cwd)
     """);

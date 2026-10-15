@@ -250,33 +250,69 @@ public sealed class HanniGramStore : IDisposable
         lock (_gate)
         {
             using var tx = _conn.BeginTransaction();
-            var project = ReadProjectByName(name, tx);
-
-            if (project is null)
-            {
-                using var insert = CreateCommand(tx);
-                insert.CommandText = "INSERT INTO projects (name, root_path, created_at_utc, updated_at_utc) VALUES ($n, $r, $c, $u); SELECT last_insert_rowid();";
-                insert.Parameters.AddWithValue("$n", name);
-                insert.Parameters.AddWithValue("$r", (object?)rootPath ?? DBNull.Value);
-                var now = DateTime.UtcNow;
-                insert.Parameters.AddWithValue("$c", now.ToString("O"));
-                insert.Parameters.AddWithValue("$u", now.ToString("O"));
-                var id = (long)insert.ExecuteScalar()!;
-                project = new Project { Id = id, Name = name, RootPath = rootPath, CreatedAtUtc = now, UpdatedAtUtc = now };
-            }
-            else if (rootPath != null && project.RootPath != rootPath)
-            {
-                using var update = CreateCommand(tx);
-                update.CommandText = "UPDATE projects SET root_path = $r, updated_at_utc = $u WHERE id = $id";
-                update.Parameters.AddWithValue("$r", rootPath);
-                update.Parameters.AddWithValue("$u", Now());
-                update.Parameters.AddWithValue("$id", project.Id);
-                update.ExecuteNonQuery();
-                project.RootPath = rootPath;
-            }
-
+            var project = GetOrCreateProjectCore(name, rootPath, tx);
             tx.Commit();
             return project;
+        }
+    }
+
+    /// <summary>
+    /// Transaction-aware project create-or-read, so a caller that already holds
+    /// a transaction (promotion is the reason it exists) does not open a nested
+    /// one.
+    /// </summary>
+    private Project GetOrCreateProjectCore(string name, string? rootPath, SqliteTransaction tx)
+    {
+        var project = ReadProjectByName(name, tx);
+
+        if (project is null)
+        {
+            using var insert = CreateCommand(tx);
+            insert.CommandText = "INSERT INTO projects (name, root_path, created_at_utc, updated_at_utc) VALUES ($n, $r, $c, $u); SELECT last_insert_rowid();";
+            insert.Parameters.AddWithValue("$n", name);
+            insert.Parameters.AddWithValue("$r", (object?)rootPath ?? DBNull.Value);
+            var now = DateTime.UtcNow;
+            insert.Parameters.AddWithValue("$c", now.ToString("O"));
+            insert.Parameters.AddWithValue("$u", now.ToString("O"));
+            var id = (long)insert.ExecuteScalar()!;
+            project = new Project { Id = id, Name = name, RootPath = rootPath, CreatedAtUtc = now, UpdatedAtUtc = now };
+        }
+        else if (rootPath != null && project.RootPath != rootPath)
+        {
+            using var update = CreateCommand(tx);
+            update.CommandText = "UPDATE projects SET root_path = $r, updated_at_utc = $u WHERE id = $id";
+            update.Parameters.AddWithValue("$r", rootPath);
+            update.Parameters.AddWithValue("$u", Now());
+            update.Parameters.AddWithValue("$id", project.Id);
+            update.ExecuteNonQuery();
+            project.RootPath = rootPath;
+        }
+
+        return project;
+    }
+
+    /// <summary>
+    /// Look up the reserved global namespace WITHOUT creating it. Read paths use
+    /// this: resolving global memory must treat "absent" as "no global memory
+    /// yet", never as an instruction to insert the sentinel row.
+    /// </summary>
+    public Project? GetGlobalProject()
+    {
+        lock (_gate)
+        {
+            return ReadProjectByName(MemoryScopes.GlobalProjectName, null);
+        }
+    }
+
+    /// <summary>
+    /// Return the reserved global namespace, creating it on first write. Only
+    /// the write paths (save-to-global, promotion) call this.
+    /// </summary>
+    public Project GetOrCreateGlobalProject()
+    {
+        lock (_gate)
+        {
+            return GetOrCreateProject(MemoryScopes.GlobalProjectName, null);
         }
     }
 
