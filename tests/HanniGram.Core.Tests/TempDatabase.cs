@@ -24,6 +24,24 @@ public sealed class TempDatabase : IDisposable
     /// <summary>Open a store bound to this test's own temp database file.</summary>
     public HanniGramStore OpenStore() => new(DbPath);
 
+    /// <summary>
+    /// Run raw SQL against this test's database, outside the store. Used to
+    /// fabricate fixtures (bulk rows, legacy schemas) without going through the
+    /// write path the test is not exercising.
+    /// </summary>
+    public void Execute(string sql, params (string Name, object? Value)[] parameters)
+    {
+        using var conn = new SqliteConnection(new SqliteConnectionStringBuilder { DataSource = DbPath }.ToString());
+        conn.Open();
+        using var cmd = conn.CreateCommand();
+        cmd.CommandText = sql;
+        foreach (var (name, value) in parameters)
+        {
+            cmd.Parameters.AddWithValue(name, value ?? DBNull.Value);
+        }
+        cmd.ExecuteNonQuery();
+    }
+
     public void Dispose()
     {
         // Drop idle pooled handles so the WAL/SHM files can be removed. Rented

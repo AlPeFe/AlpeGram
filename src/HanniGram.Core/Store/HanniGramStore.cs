@@ -284,6 +284,7 @@ public sealed class HanniGramStore : IDisposable
     {
         lock (_gate)
         {
+            limit = ClampLimit(limit);
             var list = new List<Observation>();
             using var cmd = _conn.CreateCommand();
             // updated_at_utc is the real recency signal: a topic-key upsert keeps
@@ -317,6 +318,7 @@ public sealed class HanniGramStore : IDisposable
     {
         lock (_gate)
         {
+            limit = ClampLimit(limit);
             // FtsQuery drops every term shorter than the trigram minimum, so "ab",
             // "a", "" and whitespace-only all escape to the empty string. FTS5
             // rejects MATCH '' with `fts5: syntax error near ""`, which used to
@@ -390,6 +392,7 @@ public sealed class HanniGramStore : IDisposable
     {
         lock (_gate)
         {
+            limit = ClampLimit(limit);
             var list = new List<string>();
             using var cmd = _conn.CreateCommand();
             cmd.CommandText = "SELECT DISTINCT topic_key FROM observations WHERE project_id = $p AND topic_key IS NOT NULL ORDER BY topic_key LIMIT $l";
@@ -439,6 +442,7 @@ public sealed class HanniGramStore : IDisposable
     {
         lock (_gate)
         {
+            limit = ClampLimit(limit);
             var list = new List<Session>();
             using var cmd = _conn.CreateCommand();
             cmd.CommandText = "SELECT id, project_id, session_id, started_at_utc, ended_at_utc, summary, goal, next_steps FROM sessions WHERE project_id = $p ORDER BY started_at_utc DESC LIMIT $l";
@@ -466,6 +470,13 @@ public sealed class HanniGramStore : IDisposable
     // =====================================================================
     // Helpers
     // =====================================================================
+
+    // Every caller-supplied limit is clamped into this range before it reaches a
+    // SQL LIMIT. SQLite reads LIMIT -1 as "no limit", so an unauthenticated local
+    // caller passing -1 could otherwise dump the whole corpus in one request.
+    private const int MaxLimit = 500;
+
+    private static int ClampLimit(int limit) => Math.Clamp(limit, 1, MaxLimit);
 
     /// <summary>
     /// Rebuild the FTS index from the content table. FTS5 EXTERNAL-CONTENT tables
