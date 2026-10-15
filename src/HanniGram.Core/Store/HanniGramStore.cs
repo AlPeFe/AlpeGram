@@ -91,22 +91,72 @@ public sealed class HanniGramStore : IDisposable
         // sync triggers must pass OLD values back in exactly this order.
         if (GetUserVersion() < SchemaVersion)
         {
+            // Trigger/table ordering matters. observations_fts is external-content and
+            // the sync triggers reference it by name, so dropping the table while the
+            // triggers still exist leaves them dangling and the NEXT write fails with
+            // "no such table: observations_fts". Drop triggers, then the table, then
+            // recreate both, then rebuild the index once from the content table.
+            DropFtsSyncTriggers();
             Exec("DROP TABLE IF EXISTS observations_fts;");
-            Exec(@"
-                CREATE VIRTUAL TABLE observations_fts USING fts5(
-                    title, content, what, why, where_, learned, topic_key, type,
-                    tokenize='trigram',
-                    content='observations', content_rowid='id'
-                );
-            ");
-            Exec("INSERT INTO observations_fts(observations_fts) VALUES('rebuild');");
+            CreateFtsTable();
+            CreateFtsSyncTriggers();
+            RebuildFts();
             Exec($"PRAGMA user_version={SchemaVersion};");
+        }
+        else
+        {
+            // Already migrated. Re-assert the triggers: they are the only thing that
+            // keeps the index in sync, and a database written by an intermediate
+            // build can carry the table without them.
+            CreateFtsSyncTriggers();
         }
     }
 
+    /// <summary>Create the external-content FTS index over <c>observations</c>.</summary>
+    private void CreateFtsTable() => Exec(@"
+        CREATE VIRTUAL TABLE IF NOT EXISTS observations_fts USING fts5(
+            title, content, what, why, where_, learned, topic_key, type,
+            tokenize='trigram',
+            content='observations', content_rowid='id'
+        );
+    ");
+
+    /// <summary>
+    /// The standard FTS5 external-content trigger triple. observations_fts is an
+    /// EXTERNAL-CONTENT table: it must never be written with a plain INSERT/DELETE
+    /// (that corrupts the index and SQLite then reports "database disk image is
+    /// malformed" on the next write). The 'delete' command requires the OLD column
+    /// values, in the FTS column order declared in <see cref="CreateFtsTable"/>.
+    /// With these triggers, indexing is O(1) per write and runs inside the writer's
+    /// transaction, instead of rebuilding the whole corpus.
+    /// </summary>
+    private void CreateFtsSyncTriggers() => Exec(@"
+        CREATE TRIGGER IF NOT EXISTS observations_fts_ai AFTER INSERT ON observations BEGIN
+            INSERT INTO observations_fts(rowid, title, content, what, why, where_, learned, topic_key, type)
+            VALUES (new.id, new.title, new.content, new.what, new.why, new.where_, new.learned, new.topic_key, new.type);
+        END;
+        CREATE TRIGGER IF NOT EXISTS observations_fts_ad AFTER DELETE ON observations BEGIN
+            INSERT INTO observations_fts(observations_fts, rowid, title, content, what, why, where_, learned, topic_key, type)
+            VALUES ('delete', old.id, old.title, old.content, old.what, old.why, old.where_, old.learned, old.topic_key, old.type);
+        END;
+        CREATE TRIGGER IF NOT EXISTS observations_fts_au AFTER UPDATE ON observations BEGIN
+            INSERT INTO observations_fts(observations_fts, rowid, title, content, what, why, where_, learned, topic_key, type)
+            VALUES ('delete', old.id, old.title, old.content, old.what, old.why, old.where_, old.learned, old.topic_key, old.type);
+            INSERT INTO observations_fts(rowid, title, content, what, why, where_, learned, topic_key, type)
+            VALUES (new.id, new.title, new.content, new.what, new.why, new.where_, new.learned, new.topic_key, new.type);
+        END;
+    ");
+
+    /// <summary>Remove the sync triggers before their table is dropped or recreated.</summary>
+    private void DropFtsSyncTriggers() => Exec(@"
+        DROP TRIGGER IF EXISTS observations_fts_ai;
+        DROP TRIGGER IF EXISTS observations_fts_ad;
+        DROP TRIGGER IF EXISTS observations_fts_au;
+    ");
+
     private int GetUserVersion()
     {
-        using var cmd = _conn.CreateCommand();
+        using var cmd = CreateCommand();
         cmd.CommandText = "PRAGMA user_version;";
         return Convert.ToInt32(cmd.ExecuteScalar());
     }
@@ -119,42 +169,51 @@ public sealed class HanniGramStore : IDisposable
     {
         lock (_gate)
         {
-            using var cmd = _conn.CreateCommand();
-            cmd.CommandText = "SELECT id, name, root_path, created_at_utc, updated_at_utc FROM projects WHERE name = $n";
-            cmd.Parameters.AddWithValue("$n", name);
-            using var r = cmd.ExecuteReader();
-            return r.Read() ? ReadProject(r) : null;
+            return ReadProjectByName(name, null);
         }
+    }
+
+    private Project? ReadProjectByName(string name, SqliteTransaction? transaction)
+    {
+        using var cmd = CreateCommand(transaction);
+        cmd.CommandText = "SELECT id, name, root_path, created_at_utc, updated_at_utc FROM projects WHERE name = $n";
+        cmd.Parameters.AddWithValue("$n", name);
+        using var r = cmd.ExecuteReader();
+        return r.Read() ? ReadProject(r) : null;
     }
 
     public Project GetOrCreateProject(string name, string? rootPath = null)
     {
         lock (_gate)
         {
-            var existing = GetProjectByName(name);
-            if (existing != null)
+            using var tx = _conn.BeginTransaction();
+            var project = ReadProjectByName(name, tx);
+
+            if (project is null)
             {
-                if (rootPath != null && existing.RootPath != rootPath)
-                {
-                    using var up = _conn.CreateCommand();
-                    up.CommandText = "UPDATE projects SET root_path = $r, updated_at_utc = $u WHERE id = $id";
-                    up.Parameters.AddWithValue("$r", rootPath);
-                    up.Parameters.AddWithValue("$u", Now());
-                    up.Parameters.AddWithValue("$id", existing.Id);
-                    up.ExecuteNonQuery();
-                    existing.RootPath = rootPath;
-                }
-                return existing;
+                using var insert = CreateCommand(tx);
+                insert.CommandText = "INSERT INTO projects (name, root_path, created_at_utc, updated_at_utc) VALUES ($n, $r, $c, $u); SELECT last_insert_rowid();";
+                insert.Parameters.AddWithValue("$n", name);
+                insert.Parameters.AddWithValue("$r", (object?)rootPath ?? DBNull.Value);
+                var now = DateTime.UtcNow;
+                insert.Parameters.AddWithValue("$c", now.ToString("O"));
+                insert.Parameters.AddWithValue("$u", now.ToString("O"));
+                var id = (long)insert.ExecuteScalar()!;
+                project = new Project { Id = id, Name = name, RootPath = rootPath, CreatedAtUtc = now, UpdatedAtUtc = now };
+            }
+            else if (rootPath != null && project.RootPath != rootPath)
+            {
+                using var update = CreateCommand(tx);
+                update.CommandText = "UPDATE projects SET root_path = $r, updated_at_utc = $u WHERE id = $id";
+                update.Parameters.AddWithValue("$r", rootPath);
+                update.Parameters.AddWithValue("$u", Now());
+                update.Parameters.AddWithValue("$id", project.Id);
+                update.ExecuteNonQuery();
+                project.RootPath = rootPath;
             }
 
-            using var cmd = _conn.CreateCommand();
-            cmd.CommandText = "INSERT INTO projects (name, root_path, created_at_utc, updated_at_utc) VALUES ($n, $r, $c, $u); SELECT last_insert_rowid();";
-            cmd.Parameters.AddWithValue("$n", name);
-            cmd.Parameters.AddWithValue("$r", (object?)rootPath ?? DBNull.Value);
-            cmd.Parameters.AddWithValue("$c", Now());
-            cmd.Parameters.AddWithValue("$u", Now());
-            var id = (long)cmd.ExecuteScalar()!;
-            return new Project { Id = id, Name = name, RootPath = rootPath, CreatedAtUtc = DateTime.UtcNow, UpdatedAtUtc = DateTime.UtcNow };
+            tx.Commit();
+            return project;
         }
     }
 
@@ -163,7 +222,7 @@ public sealed class HanniGramStore : IDisposable
         lock (_gate)
         {
             var list = new List<Project>();
-            using var cmd = _conn.CreateCommand();
+            using var cmd = CreateCommand();
             cmd.CommandText = "SELECT id, name, root_path, created_at_utc, updated_at_utc FROM projects ORDER BY name";
             using var r = cmd.ExecuteReader();
             while (r.Read()) list.Add(ReadProject(r));
@@ -181,6 +240,8 @@ public sealed class HanniGramStore : IDisposable
     /// observation with the same key is updated in place (its id and created_at are
     /// preserved) so a topic evolves instead of accumulating stale versions. Without
     /// a topic key, a new observation is always inserted.
+    /// The write and its FTS index update (done by the sync triggers) share one
+    /// transaction, so the content table and its index can never diverge.
     /// Returns the persisted observation and whether it was newly created.
     /// </summary>
     public (Observation Observation, bool Created) SaveObservation(long projectId, string title, string content,
@@ -189,12 +250,13 @@ public sealed class HanniGramStore : IDisposable
     {
         lock (_gate)
         {
-            var existing = string.IsNullOrEmpty(topicKey) ? null : FindLatestByTopicKey(projectId, topicKey);
+            using var tx = _conn.BeginTransaction();
+            var existing = string.IsNullOrEmpty(topicKey) ? null : FindLatestByTopicKey(projectId, topicKey, tx);
             long id;
             var created = existing is null;
             if (created)
             {
-                using var cmd = _conn.CreateCommand();
+                using var cmd = CreateCommand(tx);
                 cmd.CommandText = @"
                     INSERT INTO observations (project_id, title, content, what, why, where_, learned, topic_key, type, created_at_utc, updated_at_utc)
                     VALUES ($p, $t, $c, $w, $y, $wh, $l, $tk, $ty, $n, $n);
@@ -214,7 +276,7 @@ public sealed class HanniGramStore : IDisposable
             else
             {
                 id = existing!.Id;
-                using var cmd = _conn.CreateCommand();
+                using var cmd = CreateCommand(tx);
                 cmd.CommandText = @"
                     UPDATE observations
                     SET title = $t, content = $c, what = $w, why = $y, where_ = $wh, learned = $l, type = $ty, updated_at_utc = $n
@@ -230,17 +292,22 @@ public sealed class HanniGramStore : IDisposable
                 cmd.Parameters.AddWithValue("$id", id);
                 cmd.ExecuteNonQuery();
             }
-            RebuildFts();
-            return (GetObservation(projectId, id)!, created);
+            // Read back on the same transaction rather than through the public
+            // GetObservation: that method would be correct too (it opens no
+            // transaction of its own), but binding the read to this transaction
+            // keeps the readback on the connection's active transaction.
+            var observation = ReadObservationById(projectId, id, tx)!;
+            tx.Commit();
+            return (observation, created);
         }
     }
 
-    private Observation? FindLatestByTopicKey(long projectId, string topicKey)
+    private Observation? FindLatestByTopicKey(long projectId, string topicKey, SqliteTransaction? transaction)
     {
         // Order by updated_at_utc, not created_at_utc: an upsert preserves the
         // original created_at, so created_at ordering would keep returning the
         // stalest duplicate of a topic key.
-        using var cmd = _conn.CreateCommand();
+        using var cmd = CreateCommand(transaction);
         cmd.CommandText = "SELECT id, project_id, title, content, what, why, where_, learned, topic_key, type, created_at_utc, updated_at_utc FROM observations WHERE project_id = $p AND topic_key = $tk ORDER BY updated_at_utc DESC LIMIT 1";
         cmd.Parameters.AddWithValue("$p", projectId);
         cmd.Parameters.AddWithValue("$tk", topicKey);
@@ -252,13 +319,18 @@ public sealed class HanniGramStore : IDisposable
     {
         lock (_gate)
         {
-            using var cmd = _conn.CreateCommand();
-            cmd.CommandText = "SELECT id, project_id, title, content, what, why, where_, learned, topic_key, type, created_at_utc, updated_at_utc FROM observations WHERE id = $id AND project_id = $p";
-            cmd.Parameters.AddWithValue("$id", id);
-            cmd.Parameters.AddWithValue("$p", projectId);
-            using var r = cmd.ExecuteReader();
-            return r.Read() ? ReadObservation(r) : null;
+            return ReadObservationById(projectId, id, null);
         }
+    }
+
+    private Observation? ReadObservationById(long projectId, long id, SqliteTransaction? transaction)
+    {
+        using var cmd = CreateCommand(transaction);
+        cmd.CommandText = "SELECT id, project_id, title, content, what, why, where_, learned, topic_key, type, created_at_utc, updated_at_utc FROM observations WHERE id = $id AND project_id = $p";
+        cmd.Parameters.AddWithValue("$id", id);
+        cmd.Parameters.AddWithValue("$p", projectId);
+        using var r = cmd.ExecuteReader();
+        return r.Read() ? ReadObservation(r) : null;
     }
 
     /// <summary>Delete an observation (scoped to a project). Returns true if it existed.</summary>
@@ -266,16 +338,15 @@ public sealed class HanniGramStore : IDisposable
     {
         lock (_gate)
         {
-            using var cmd = _conn.CreateCommand();
+            using var tx = _conn.BeginTransaction();
+            using var cmd = CreateCommand(tx);
             cmd.CommandText = "DELETE FROM observations WHERE id = $id AND project_id = $p";
             cmd.Parameters.AddWithValue("$id", id);
             cmd.Parameters.AddWithValue("$p", projectId);
             var deleted = cmd.ExecuteNonQuery() > 0;
-            if (deleted)
-            {
-                // Re-index (the removed row drops out of the external-content index).
-                RebuildFts();
-            }
+            // The AFTER DELETE trigger drops the row from the external-content
+            // index inside this same transaction; no corpus rebuild is needed.
+            tx.Commit();
             return deleted;
         }
     }
@@ -286,7 +357,7 @@ public sealed class HanniGramStore : IDisposable
         {
             limit = ClampLimit(limit);
             var list = new List<Observation>();
-            using var cmd = _conn.CreateCommand();
+            using var cmd = CreateCommand();
             // updated_at_utc is the real recency signal: a topic-key upsert keeps
             // created_at_utc, so ordering by created_at would bury a memory that
             // just evolved at its original position.
@@ -304,7 +375,7 @@ public sealed class HanniGramStore : IDisposable
         lock (_gate)
         {
             var list = new List<Observation>();
-            using var cmd = _conn.CreateCommand();
+            using var cmd = CreateCommand();
             cmd.CommandText = "SELECT id, project_id, title, content, what, why, where_, learned, topic_key, type, created_at_utc, updated_at_utc FROM observations WHERE project_id = $p AND topic_key = $tk ORDER BY created_at_utc DESC";
             cmd.Parameters.AddWithValue("$p", projectId);
             cmd.Parameters.AddWithValue("$tk", topicKey);
@@ -356,7 +427,7 @@ public sealed class HanniGramStore : IDisposable
         {
             return list;
         }
-        using var cmd = _conn.CreateCommand();
+        using var cmd = CreateCommand();
         var sql = @"
             SELECT o.id, o.title, o.content, o.topic_key, o.type, o.created_at_utc, bm25(observations_fts) AS rank
             FROM observations_fts
@@ -394,7 +465,7 @@ public sealed class HanniGramStore : IDisposable
         {
             limit = ClampLimit(limit);
             var list = new List<string>();
-            using var cmd = _conn.CreateCommand();
+            using var cmd = CreateCommand();
             cmd.CommandText = "SELECT DISTINCT topic_key FROM observations WHERE project_id = $p AND topic_key IS NOT NULL ORDER BY topic_key LIMIT $l";
             cmd.Parameters.AddWithValue("$p", projectId);
             cmd.Parameters.AddWithValue("$l", limit);
@@ -412,12 +483,14 @@ public sealed class HanniGramStore : IDisposable
     {
         lock (_gate)
         {
-            using var cmd = _conn.CreateCommand();
+            using var tx = _conn.BeginTransaction();
+            using var cmd = CreateCommand(tx);
             cmd.CommandText = "INSERT INTO sessions (project_id, session_id, started_at_utc) VALUES ($p, $s, $n); SELECT last_insert_rowid();";
             cmd.Parameters.AddWithValue("$p", projectId);
             cmd.Parameters.AddWithValue("$s", sessionId);
             cmd.Parameters.AddWithValue("$n", Now());
             var id = (long)cmd.ExecuteScalar()!;
+            tx.Commit();
             return new Session { Id = id, ProjectId = projectId, SessionId = sessionId, StartedAtUtc = DateTime.UtcNow };
         }
     }
@@ -426,7 +499,8 @@ public sealed class HanniGramStore : IDisposable
     {
         lock (_gate)
         {
-            using var cmd = _conn.CreateCommand();
+            using var tx = _conn.BeginTransaction();
+            using var cmd = CreateCommand(tx);
             cmd.CommandText = "UPDATE sessions SET ended_at_utc = $e, summary = $s, goal = $g, next_steps = $n WHERE project_id = $p AND session_id = $sid";
             cmd.Parameters.AddWithValue("$e", Now());
             cmd.Parameters.AddWithValue("$s", (object?)summary ?? DBNull.Value);
@@ -435,6 +509,7 @@ public sealed class HanniGramStore : IDisposable
             cmd.Parameters.AddWithValue("$p", projectId);
             cmd.Parameters.AddWithValue("$sid", sessionId);
             cmd.ExecuteNonQuery();
+            tx.Commit();
         }
     }
 
@@ -444,7 +519,7 @@ public sealed class HanniGramStore : IDisposable
         {
             limit = ClampLimit(limit);
             var list = new List<Session>();
-            using var cmd = _conn.CreateCommand();
+            using var cmd = CreateCommand();
             cmd.CommandText = "SELECT id, project_id, session_id, started_at_utc, ended_at_utc, summary, goal, next_steps FROM sessions WHERE project_id = $p ORDER BY started_at_utc DESC LIMIT $l";
             cmd.Parameters.AddWithValue("$p", projectId);
             cmd.Parameters.AddWithValue("$l", limit);
@@ -483,11 +558,12 @@ public sealed class HanniGramStore : IDisposable
     /// must NOT be written directly: a manual INSERT/DELETE against observations_fts
     /// corrupts the index ("database disk image is malformed" on the first write
     /// after a rebuild). 'rebuild' is the canonical external-content sync — it is
-    /// O(N) but safe and fast at personal-memory scale.
+    /// O(N) but safe. It runs ONLY on schema migration (Initialize); the write path
+    /// is served by the O(1) sync triggers, so no save/delete touches the corpus.
     /// </summary>
     private void RebuildFts()
     {
-        using var cmd = _conn.CreateCommand();
+        using var cmd = CreateCommand();
         cmd.CommandText = "INSERT INTO observations_fts(observations_fts) VALUES('rebuild');";
         cmd.ExecuteNonQuery();
     }
@@ -527,9 +603,24 @@ public sealed class HanniGramStore : IDisposable
 
     private static string Now() => DateTime.UtcNow.ToString("O");
 
+    /// <summary>
+    /// Create a command on the shared connection. When a transaction is open the
+    /// command must be bound to it, otherwise Microsoft.Data.Sqlite rejects the
+    /// command for not matching the connection's active transaction.
+    /// </summary>
+    private SqliteCommand CreateCommand(SqliteTransaction? transaction = null)
+    {
+        var cmd = _conn.CreateCommand();
+        if (transaction is not null)
+        {
+            cmd.Transaction = transaction;
+        }
+        return cmd;
+    }
+
     private void Exec(string sql)
     {
-        using var cmd = _conn.CreateCommand();
+        using var cmd = CreateCommand();
         cmd.CommandText = sql;
         cmd.ExecuteNonQuery();
     }
@@ -537,7 +628,7 @@ public sealed class HanniGramStore : IDisposable
     /// <summary>Run a value-returning PRAGMA, consuming its result row.</summary>
     private void Pragma(string sql)
     {
-        using var cmd = _conn.CreateCommand();
+        using var cmd = CreateCommand();
         cmd.CommandText = sql;
         cmd.ExecuteScalar();
     }
