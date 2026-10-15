@@ -74,6 +74,53 @@ Both scopes share one store, one FTS index, one upsert-by-`topic_key` mechanism.
 written to a scope explicitly; it can be promoted from `project` to `global` when it proves
 generic. Cross-scope search returns project hits **and** global hits with their origin marked.
 
+## HanniPI integration constraints (verified 2026-10-15)
+
+The harness side was mapped before designing the global scope and MCP. These are facts, not
+assumptions, and they amend the tasks below.
+
+**How HanniGram is delivered to the harness.** `hannigram-version.json` (keys: `repo`, `tag`,
+`sha256`, `commit`, `builtAt`) is read by `scripts/pack-hannigram.ps1` and the release skill.
+`hanni-setup.ps1` downloads the asset, verifies its SHA256, installs it to
+`%LOCALAPPDATA%\HanniPI\hannigram`, sets `HANNIGRAM_DAEMON`, and copies the asset's
+`pi-extension/` to `~/.pi/agent/extensions/hannigram`. So the extension ships **inside the
+release asset** — a new tool is only live after a new asset and a version bump.
+
+**Token cost is the binding constraint.** The `sodd` extension hooks `pi.on("context")`, which
+fires **before every LLM call**, and injects: the sODD guidance block, up to 12 ADR rows
+(`[HanniGram · decisiones/convenciones — respeta esto]`), and up to 6 recent non-ADR rows
+(`[HanniGram · contexto reciente]`). It reads SQLite directly and never injects full content.
+
+→ **Plan amendment:** global memory must NOT enter that same injection path wholesale. It gets
+its own minimal budget (pinned heuristics only, hard cap) and everything else stays on-demand.
+Added as **T21**.
+
+**MCP is natively supported.** Config lives in `<agentDir>/mcp.json` and `<cwd>/.pi/mcp.json`
+(`{"mcpServers":{"name":{"command","args","env","cwd"}}}`), stdio or streamable HTTP; tools
+register as `mcp__<server>__<tool>` with default exposure `codemode`.
+
+→ **Plan amendment to T16/T17:** the MCP server must be **opt-in and disconnected by default**,
+absent from ordinary prompt context, consistent with the previously recorded preference that
+MCPs stay optional and loaded on demand. It is for portability to other harnesses; the Pi
+extension stays the primary zero-config path.
+
+**Gaps found in the harness contract.**
+
+- `mem_update` is referenced by `.pi/skills/sodd/SKILL.md` but HanniGram never implemented it —
+  a broken contract today. Added as **T20**.
+- HanniGram's README says injection happens "when a task is active", but `readProjectMemory`
+  is not gated on an active sheet and injects whenever the project has matching observations.
+  Added as **T22**.
+
+**Task additions**
+
+- [ ] **T20** Implement `mem_update` (update an observation by id, preserving `created_at_utc`
+      and re-scoping through the same `topic_key` rules) and expose it in the extension, so the
+      reference in the sODD skill stops being a broken contract.
+- [ ] **T21** Global injection budget: at most a small fixed number of pinned global heuristics
+      enter the automatic context path; everything else global is retrieved on demand.
+- [ ] **T22** Fix the doc/code discrepancy about when memory is auto-injected.
+
 ## Tasks
 
 ### Slice 1 — correctness and tests
@@ -95,13 +142,19 @@ generic. Cross-scope search returns project hits **and** global hits with their 
       `AFTER UPDATE`, using the `'delete'` command with OLD values) so indexing is O(1) and
       transactional; wrap mutating store operations in a transaction. Test: index stays
       consistent after save/update/delete without any rebuild call.
-- [ ] **T7** Sessions: unique index on `(project_id, session_id)`; `EndSession` upserts
-      instead of updating all matching rows. Test: two `session_summary` calls for one
+- [x] **T7** Sessions: unique index on `(project_id, session_id)`, created after
+      deduplicating legacy rows (prefer a row with a summary, else the latest
+      `started_at_utc`); the index is re-asserted on the already-migrated path too.
+      `StartSession` is idempotent (`INSERT ... ON CONFLICT DO NOTHING` + read-back), so
+      `EndSession` updates exactly one row. Test: two `session_summary` calls for one
       session id produce one row and the latest summary.
-- [ ] **T8** `FtsTrigramFallback`: build trigrams per token (no cross-word grams), use a
-      `HashSet`, and make the collected/used cap consistent. Test: a multi-word typo query
-      still matches.
-- [ ] **T9** CLI: actually read `HANNIGRAM_CWD` (currently advertised in help, never used).
+- [x] **T8** `FtsTrigramFallback`: build trigrams per token (no cross-word grams), dedup
+      with a `HashSet`, one consistent per-token cap, and AND the per-token OR-groups so
+      every query term must be present while a typo inside one token still matches. Test:
+      a multi-word typo query still matches; an absent token is not satisfied by another.
+- [x] **T9** CLI: read `HANNIGRAM_CWD` and the `project [cwd]` positional argument, via a
+      testable `HanniGram.Core.Cli.CwdResolver`. Test: the helper's precedence and the
+      positional read.
 
 ### Slice 2 — scopes
 
@@ -238,4 +291,79 @@ cache — the only restore noise is `NU1900` for the unreachable private feed
   T8 is meant to fix; until then the tests document the constraint explicitly.
 - **New indexes.** `idx_obs_project_updated` on `(project_id, updated_at_utc DESC)` supports
   the T4 ordering; `idx_obs_topic` is unchanged. No index was dropped.
+
+### Slice 1 continued — T7 / T8 / T9 implemented and verified (2026-10-15)
+
+Work-unit commits on `feat/memory-v2`:
+
+| Task | Commit | Summary |
+|---|---|---|
+| T7 | `5a9c377` | `fix(core): enforce one session row per project and session id` |
+| T8 | `5bf34d6` | `fix(core): build trigram fallback per token and AND the token groups` |
+| T9 | `b802cb5` | `fix(cli): honour HANNIGRAM_CWD and the positional project cwd` |
+
+Observed evidence (`dotnet --version` = `10.0.401`):
+
+- `dotnet build HanniGram.slnx -c Release --nologo` → 0 errors, 9 warnings (all `NU1900` for
+  the unreachable private feed; no compiler warning introduced).
+- `dotnet test HanniGram.slnx -c Release --nologo` → **58 passed, 0 failed** (41 before this
+  slice; +5 T7, +3 T8, +9 T9).
+- Each fix was temporarily reverted and its regression tests re-run before restoring, to prove
+  the tests detect the defect:
+  - **T7** (pre-fix store, SchemaVersion 2): 5 of 8 `SessionStoreTests` failed —
+    `StartSession_IsIdempotentForTheSameSessionId` → `Assert.Equal Failure: Values differ`
+    (Expected 1, Actual 2); `StartingTwiceThenEnding_UpdatesTheSingleRow` and
+    `TwoSessionSummaries_ProduceOneRowAndTheLatestSummaryWins` and
+    `ReopeningOnTheCurrentVersion_ReassertsTheSessionsUniqueIndex` → `Assert.Single Failure:
+    The collection contained 2 items`; `ReopeningWithDuplicateSessions_DeduplicatesAndPrefersTheSummaryRow`
+    → `Assert.Single Failure: The collection contained 3 items`.
+  - **T8** (pre-token-grouping fallback): `Search_TwoTokensWhereTheSecondIsAbsent_ReturnsNothing`
+    and `Search_TwoUnrelatedTokensInDifferentDocuments_DoNotMatchEachOther` both failed with
+    `Assert.Empty Failure: Collection was not empty`. The single-token typo test
+    `Search_TypoWithinAToken_StillMatchesViaTheFallback` passed pre-fix **by design** — it is the
+    guard against over-fixing, not a regression detector.
+  - **T9** (helper carrying the old rule): `Resolve_EnvBeatsCurrentDirectory` and the three
+    positive `Positional_*` tests failed with `Assert.Equal Failure: Strings differ`.
+- End-to-end against a **daemon built from source**, `HANNIGRAM_DB` = temp file,
+  `HANNIGRAM_URLS=http://127.0.0.1:8799`; server stopped and temp dir removed afterwards. The
+  real db (`~/.hannigram/hannigram.db`, mtime `2026-10-15T07:30:30Z`) and the live daemon on
+  8765 were never touched — the db mtime is byte-identical before and after:
+  - `/api/sessions/start` + `/api/sessions/end` twice for `e2e-session` →
+    `GET /api/sessions` returned **count 1** with summary `second summary`. Proves T7.
+  - POST `content="zephyrous payload"`, then `GET /api/search?q=zephyruos` (strict AND match
+    empty) → **1 hit** with content `zephyrous payload` (trigram fallback exercised); then
+    `GET /api/search?q=zephyrous kwyjibo` → raw response **`[]`**. Proves T8.
+  - `dotnet HanniGram.Cli.dll project` run from the repo dir with `HANNIGRAM_CWD` = a temp dir →
+    **`hannigram-e2e-cwd`**; `project <other-temp-dir>` → **`hannigram-positional-cwd`**
+    (positional beats the env var); the same with `HANNIGRAM_CWD` unset → positional honoured.
+    Proves T9.
+
+### What changed the plan (Slice 1 continued)
+
+- **T7 `EndSession` needed no code change.** Once `(project_id, session_id)` is unique, the
+  existing single `UPDATE ... WHERE project_id AND session_id` matches exactly one row. T7 is
+  therefore the index + dedup migration + idempotent `StartSession`; the task's "EndSession
+  upserts" wording is satisfied causally. No insert-on-missing behaviour was added: nothing
+  required it, and it would change semantics.
+- **T8 test (c) cannot use two overlapping words.** The specified algorithm ORs a token's own
+  grams, so in `(g1 OR g2 …) AND (h1 OR h2 …)` any trigram shared by the two tokens lets each
+  document satisfy the *other* token's group — `alphaword` / `gammaword` (sharing `awa`, `wor`,
+  `ord`) still match each other post-fix. The regression test that actually distinguishes fixed
+  from broken is a two-token query whose words are **gram-disjoint** and live in **different
+  documents**: pre-fix it returns both documents, post-fix it returns none. The test documents
+  this.
+- **The trigram-disjoint fixture comments stay.** A single absent token can still match via its
+  own OR-group (that is exactly the required typo tolerance), so a "term removed from the index"
+  assertion in `FtsTriggerTests` still needs fixtures that share no trigram. The T8 fix removes
+  the *cross-token* merging, not single-token tolerance, so the earlier constraint is **not**
+  obsolete and the workaround was not removed.
+- **`user_version` is now 3.** `Initialize` calls `EnsureSessionsUniqueIndex()` in both branches,
+  so the index is re-asserted on the already-migrated path exactly like the FTS trigger triple.
+  The dedup runs only when the index is being created, so normal opens stay cheap.
+- **`FtsQuery` and the fallback now share one whitespace tokenizer** (`QueryTokens`), so "which
+  tokens are terms" has a single implementation.
+- **Pre-existing uncommitted doc section.** The working tree already carried an uncommitted
+  "HanniPI integration constraints" section (T20–T22) from the preceding session; it is a
+  doc-only change to this same file and is folded into this slice's documentation commit instead
+  of being left dirty or dropped.
 
