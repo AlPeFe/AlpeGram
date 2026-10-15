@@ -126,7 +126,10 @@ extension stays the primary zero-config path.
       reference in the sODD skill stops being a broken contract.
 - [x] **T21** Global injection budget: at most a small fixed number of pinned global heuristics
       enter the automatic context path; everything else global is retrieved on demand.
-- [ ] **T22** Fix the doc/code discrepancy about when memory is auto-injected.
+- [x] **T22** Fix the doc/code discrepancy about when memory is auto-injected.
+      (Slice 5 — HanniGram's own README was corrected. The exact "cuando hay una tarea
+      activa" claim is **not** in HanniGram: it lives in the HanniPI repo and is reported
+      in the Log instead of being edited here.)
 
 ## Tasks
 
@@ -192,11 +195,13 @@ extension stays the primary zero-config path.
 
 ### Slice 5 — integration and docs
 
-- [ ] **T17** Pi extension: expose the new tools and scope parameter; keep prompt text
-      minimal so tool descriptions do not inflate every request.
+- [x] **T17** Pi extension: expose the new tools and scope parameter; keep prompt text
+      minimal so tool descriptions do not inflate every request. (Slice 5 — 14 tools;
+      no automatic injection was added.)
 - [ ] **T18** HanniPI integration: bump `hannigram-version.json` and the packaged asset.
-- [ ] **T19** Docs: README (scopes, review loop, MCP), fix the committed
-      `.hannigram/memory.md` that still points at another machine's db path.
+- [x] **T19** Docs: README (scopes, review loop, MCP), fix the committed
+      `.hannigram/memory.md` that still points at another machine's db path. (Slice 5 —
+      the export no longer emits an absolute database path and was regenerated.)
 
 ## Acceptance criteria
 
@@ -679,4 +684,129 @@ Observed evidence (`dotnet --version` = `10.0.401`):
 - **`instructions` was omitted from `initialize` and every tool description is ≤ 300 chars.** The MCP
   surface enters a model's prompt, so T16 keeps it thin on purpose (this is the same "no token
   overhead" thread as T15).
+
+### Slice 5 — T17 / T19 / T22 + release preparation (2026-10-15)
+
+Work-unit commits on `feat/memory-v2`:
+
+| Task | Commit | Summary |
+|---|---|---|
+| T17 | `84dd791` | `feat(pi-extension): expose the memory scopes, lifecycle and update tools` |
+| T19 (export) | `192c9ba` | `fix(cli): keep the local database path out of the memory export` |
+| T19 (docs) | `839527b` | `docs: document the memory scopes, cross-scope search and the review loop` |
+| release prep | `c4806f8` | `chore(release): add the changelog and bump the extension to 0.2.0` |
+| T17/T19/T22 (log) | _(this entry)_ | `docs(core): record the slice 5 evidence in the feature log` |
+
+The extension now registers **14** tools — `mem_current_project, mem_save, mem_delete, mem_search,
+mem_context, mem_timeline, mem_get_observation, mem_suggest_topic_key, mem_session_summary,
+mem_update, mem_review, mem_promote, mem_state, mem_pin` — the same surface the MCP server exposes.
+`mem_save` gained `scope=project|global`, `mem_search` gained `scope=project|global|all` (default
+`all`, each hit rendered with its origin), the by-id mutations (`mem_update`, `mem_state`,
+`mem_pin`) accept `scope`, and the save response surfaces the compact `review` hint. Every
+description stays short and decision-oriented, no tool was added that injects memory text on its
+own, and no argument was added that nothing uses.
+
+Observed evidence (`dotnet --version` = `10.0.401`, `node --version` = `v24.14.0`; restore from the
+local NuGet cache; the only restore noise is `NU1900` for the unreachable private feed
+`treball.original-soft.com`):
+
+- `dotnet build HanniGram.slnx -c Release --nologo` → **0 errors** (12 warnings: 11 `NU1900`, plus
+  the pre-existing `CS8604` in `Program.cs`).
+- `dotnet test HanniGram.slnx -c Release --nologo` → **180 passed, 0 failed** (122 Core + 58 MCP),
+  unchanged from Slice 4.
+- `node --experimental-strip-types --no-warnings verify-extension.mjs` against a **daemon built from
+  source** (`HANNIGRAM_DB` = temp file, `HANNIGRAM_URLS=http://127.0.0.1:8791`, jiti loads the real
+  `index.ts`) → **exit 0**, `Registered 14 tools`, `Tool list matches the expected 14 tools`,
+  `ALL TOOLS EXECUTED OK`. The run exercised every new capability through the extension's own HTTP
+  calls and asserted the results:
+  - `mem_save … scope=global` → `Saved observation #2 (global)`.
+  - the same global row read back from a **second project cwd** with `scope=all` → labelled
+    `(global)` (asserted on `details[].scope === "global"`).
+  - `mem_update {id:1, learned:…}` → `Updated observation #1`.
+  - `mem_state {id:3, state:needs_review}` → `Observation #3 state: needs_review`, and
+    `mem_review` then listed that same id.
+  - `mem_promote {id:3}` → `Promoted #3 to global (moved)`.
+  - `mem_pin {id:2, pinned:true, scope:global}` → `Observation #2 pinned: true`.
+- Raw HTTP transcript against that daemon (fresh temp db, `Invoke-WebRequest` bodies quoted):
+  - `POST /api/observations?cwd=<alpha>` → `200 {"observation":{…,"state":"active","scope":"project"},
+    "created":true,"scope":"project"}`.
+  - `GET /api/search?cwd=<beta>&q=vrmxapricotdelta&scope=all` → **`200 []`** (a project namespace is
+    not visible from another project).
+  - `POST /api/observations/{id}/promote?cwd=<alpha>` → `200 {…"projectId":2,"scope":"global"},
+    "merged":false,"outcome":"moved"`.
+  - `GET /api/search?cwd=<alpha>&q=vrmxapricotdelta&scope=project` → **`200 []`** (the row left the
+    project) and `GET /api/search?cwd=<beta>&q=vrmxapricotdelta&scope=all` → **`200 [{… "id":4 …,
+    "scope":"global"}]`** — the promoted memory is retrievable cross-project with no FTS rebuild.
+  - `PUT /api/observations/4?cwd=<alpha>` → `createdPreserved=true`, `updatedMoved=true`;
+    `POST …/state {state:needs_review}` → `"state":"needs_review"`; `POST …/pin?scope=global
+    {pinned:true}` → `"pinned":true`; `GET /api/review?cwd=<alpha>&scope=all` → a bounded item list
+    with `needs_review` rows and truncated previews.
+  - Historical note: two earlier probe queries were misleading for the reasons already recorded in
+    Slices 1 and 3 — a flagged row (`needs_review`) is excluded from a default search, and a
+    single-token query still matches through the documented trigram fallback. The checks above use a
+    trigram-disjoint marker and an active row.
+- `.hannigram/memory.md` regenerated with `hannigram init --cwd <repo>` against a **copy** of the
+  user's database (the real file is held by the live daemon; it was only ever copied from, and its
+  mtime was identical before and after: `2026-10-15T07:30:30Z`). Result:
+  `# Memoria del proyecto — AlPeFe/HanniGram` / `BD local (fuente de verdad):
+  ~/.hannigram/hannigram.db — ruta configurable con HANNIGRAM_DB.` / `Observaciones: 0`. A grep for
+  `alexlocal`, `C:\Users` and `/Users/` in the file finds **nothing**.
+- Version: `pi-extension/package.json` `0.1.0` → **`0.2.0`**; the README tag example `v0.1.0` →
+  `v0.2.0`. `.github/workflows/release.yml` and `scripts/pack-asset.ps1` carry no version constant
+  (they take the tag / `-Version` at build time, and their `v0.1.0` occurrences are usage examples in
+  a description and a comment). No workflow trigger or permission was touched.
+
+#### T22 — where the claim actually lives
+
+The exact claim is **not** in HanniGram. It is in the HanniPI repo, which this slice must not edit:
+
+> `C:\Users\alexp\source\repos\HanniPI\README.md`, line 34:
+> `- **Inyección automática** — cuando hay una tarea activa, las observaciones recientes del proyecto se inyectan al contexto para que el agente recuerde.`
+
+Reality, verified in `HanniPI/packages/coding-agent/src/extensions/sodd/index.ts`:
+`readProjectMemory` (line 95) is called from the `pi.on("context")` handler (line 310), which fires
+before **every** LLM call, and the only guard is `if (adr.length === 0 && context.length === 0)
+return;` (line 311). There is no dependency on an active sheet, so the harness injects whenever the
+project has matching observations. HanniGram's own README was corrected accordingly (it previously
+said the injection happens "al reabrir un proyecto" and reported an index of "número de ADR, temas,
+última decisión", which is not what the hook pushes: it pushes up to 12 ADR rows and up to 6 recent
+rows as `title (topic_key): learned`).
+
+### What changed the plan (Slice 5)
+
+- **The committed export is a fossil from another machine.** `.hannigram/memory.md` was written on
+  2026-10-08 against `C:\Users\alexlocal\.hannigram\hannigram.db` with one observation
+  (`#2 test trigram pastel rosado`). The database on **this** machine is a different one: it is at
+  `user_version` 1 and holds three projects (`stage`, `demo`, `OriginalSoft/Gam.A3`) and exactly one
+  observation, which belongs to `OriginalSoft/Gam.A3`. There is **no** `AlPeFe/HanniGram` row, so a
+  faithful regeneration exports **0 observations** and the palette ADR disappears from the file.
+  That is the honest result of "regenerate from real data"; hand-copying the old row back would be
+  the fiction the task forbids. The follow-up decision (re-seed memory on the machine that owns the
+  database, or drop the committed export) belongs to the orchestrator, not to this slice.
+- **The task's premise about the tool descriptions was wrong.** The prompt described the extension's
+  descriptions as "in Spanish"; they are in **English** (only the `ctx.ui.notify` strings are
+  Spanish). The new descriptions stay in English to match the file, and the notify strings stay in
+  Spanish to match the existing UI copy.
+- **`mem_context` was left on `/api/observations`.** Its sibling `GET /api/context` (T21) is the
+  *automatic* injection surface, and T21's consumer is HanniPI's context hook reading SQLite
+  directly — not a tool the model calls. Re-pointing `mem_context` at it would have turned an
+  existing on-demand contract (recent rows with content) into previews, which the slice was not asked
+  to do. The bounded surface therefore stays a server capability; if the harness should also reach
+  it, that is a follow-up.
+- **`mem_search` did not gain a `state` filter.** The task listed exactly two parameter additions
+  (`scope` on save and search) and the "do not add fields nobody uses" rule, so the
+  archived/`needs_review` selector stays a CLI/API/MCP capability. `mem_review` covers the review side
+  of the loop.
+- **HanniPI has a hardcoded mem_* inventory that does not know the five new tools.**
+  `HanniPI/packages/coding-agent/src/extensions/hanniorq/index.ts` lines 110-120 list the read and
+  write tools used for its end-of-turn memory line; `mem_update`, `mem_promote`, `mem_state` and
+  `mem_pin` are in neither set and `mem_review` is not in the read set. Nothing breaks (the detail
+  helper falls back to the raw tool name), but the accounting under-reports. Reported, not patched:
+  HanniPI is out of bounds for this slice.
+- **`promote` keeps its own resolution rule.** The route resolves the project from `cwd` and takes no
+  `scope` (a promotion only makes sense from a project namespace into the global one), so the
+  extension's `mem_promote` deliberately takes a single `id` argument.
+- **The regenerated export keeps the generator's LF endings.** The repository uses
+  `core.autocrlf=true`, so the worktree file is checked out as CRLF while the index stores LF; the
+  CLI writes LF and nothing else changed.
 
