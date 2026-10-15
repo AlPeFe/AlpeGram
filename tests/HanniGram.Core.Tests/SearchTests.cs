@@ -124,4 +124,51 @@ public sealed class SearchTests
 
         Assert.Equal(observation.Id, hit.Id);
     }
+
+    // The strict AND match on the misspelling "zephyruos" is empty, so the trigram
+    // fallback runs. A typo *inside* one token must still match the intended row.
+    [Fact]
+    public void Search_TypoWithinAToken_StillMatchesViaTheFallback()
+    {
+        using var db = new TempDatabase();
+        using var store = db.OpenStore();
+        var project = store.GetOrCreateProject("alpha");
+        store.SaveObservation(project.Id, "Generic title", "zephyrous payload");
+
+        var hit = Assert.Single(store.Search(project.Id, "zephyruos"));
+
+        Assert.Contains("zephyrous", hit.Content);
+    }
+
+    // "all query terms present" must survive the fallback: with "kwyjibo" absent
+    // from every document, no document may be returned even though "zephyrous" is
+    // present. Before the fix the fallback ORed every gram, so a present token
+    // dragged the hit in on its own.
+    [Fact]
+    public void Search_TwoTokensWhereTheSecondIsAbsent_ReturnsNothing()
+    {
+        using var db = new TempDatabase();
+        using var store = db.OpenStore();
+        var project = store.GetOrCreateProject("alpha");
+        store.SaveObservation(project.Id, "Generic title", "zephyrous payload");
+
+        Assert.Empty(store.Search(project.Id, "zephyrous kwyjibo"));
+    }
+
+    // The two words sit in different documents and the query asks for both, so the
+    // fallback must not merge their per-token gram groups cross-document. Before
+    // the fix the fallback ORed every gram, returning a hit for each document.
+    // The fixtures are gram-disjoint on purpose: with the per-token AND, a shared
+    // gram would let each document satisfy the other token's group (see T8 notes).
+    [Fact]
+    public void Search_TwoUnrelatedTokensInDifferentDocuments_DoNotMatchEachOther()
+    {
+        using var db = new TempDatabase();
+        using var store = db.OpenStore();
+        var project = store.GetOrCreateProject("alpha");
+        store.SaveObservation(project.Id, "First", "obsidianwalnut");
+        store.SaveObservation(project.Id, "Second", "geraniumposts");
+
+        Assert.Empty(store.Search(project.Id, "obsidianwalnut geraniumposts"));
+    }
 }

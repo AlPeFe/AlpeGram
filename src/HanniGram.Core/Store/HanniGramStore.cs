@@ -643,37 +643,64 @@ public sealed class HanniGramStore : IDisposable
         cmd.ExecuteNonQuery();
     }
 
+    // Minimum trigger length of the trigram tokenizer. A term shorter than this
+    // cannot be matched by grams and FtsQuery drops it too.
+    private const int TrigramLength = 3;
+
+    // One cap for the fallback, applied PER TOKEN. The old code collected up to 40
+    // grams and then used only 20 — neither was a documented bound. Bounding each
+    // token keeps the OR-group small no matter how many tokens the query has.
+    private const int MaxTrigramsPerToken = 32;
+
+    /// <summary>
+    /// Split a query into terms on any whitespace, so a whitespace-only query
+    /// (tabs, newlines) collapses to "no terms" instead of becoming a MATCH
+    /// expression that FTS5 rejects with `syntax error near ""`.
+    /// </summary>
+    private static string[] QueryTokens(string raw) =>
+        raw.Split(new[] { ' ', '\t', '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries);
+
     private static string FtsQuery(string raw)
     {
         // Escape FTS5 special chars and AND the terms so multi-word queries
         // require all terms (closer to a focused search). Trigram tokenizer
         // matches substrings of >=3 chars; drop 1-2-char terms (they would
         // match nothing / could error) so a typo'd fragment still finds data.
-        // Split on any whitespace so a whitespace-only query (tabs, newlines)
-        // also collapses to "no terms" instead of becoming a MATCH expression.
-        var terms = raw.Split(new[] { ' ', '\t', '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries)
-            .Where(t => t.Length >= 3)
+        var terms = QueryTokens(raw)
+            .Where(t => t.Length >= TrigramLength)
             .Select(t => "\"" + t.Replace("\"", "\"\"") + "\"");
         return string.Join(" AND ", terms);
     }
 
     /// <summary>
-    /// OR of the query's trigrams: enables fuzzy/typo-tolerant matching. With a
-    /// trigram tokenizer, "rozado" and "rosado" share enough trigrams that OR-ing
-    /// them lets bm25 rank the typo'd document. Cap the OR list so query size
-    /// stays bounded (trigram only needs >=3 chars, and we only enter this path
-    /// for queries of >=6 letters).
+    /// Typo-tolerant fallback used only when the strict AND match is empty. It
+    /// keeps "all query terms must be present" semantics: each token contributes
+    /// its own OR-group of trigrams, and the token groups are ANDed together. A
+    /// typo inside one token still matches (its group shares enough grams), but a
+    /// token entirely absent cannot be satisfied by another token's grams.
+    /// Trigrams are built per token — never across token boundaries — so no gram
+    /// spans a space, and a HashSet keeps the dedup linear instead of quadratic.
     /// </summary>
     private static string FtsTrigramFallback(string raw)
     {
-        var grams = new List<string>();
-        var norm = new string(raw.Where(char.IsLetterOrDigit).ToArray()).ToLowerInvariant();
-        for (var i = 0; i + 3 <= norm.Length && grams.Count < 40; i++)
+        var tokenGroups = new List<string>();
+        foreach (var token in QueryTokens(raw))
         {
-            var g = norm.Substring(i, 3);
-            if (!grams.Contains(g)) grams.Add(g);
+            var norm = new string(token.Where(char.IsLetterOrDigit).ToArray()).ToLowerInvariant();
+            if (norm.Length < TrigramLength) continue;
+
+            var seen = new HashSet<string>();
+            var grams = new List<string>();
+            for (var i = 0; i + TrigramLength <= norm.Length && grams.Count < MaxTrigramsPerToken; i++)
+            {
+                var g = norm.Substring(i, TrigramLength);
+                if (seen.Add(g)) grams.Add(g);
+            }
+            if (grams.Count == 0) continue;
+
+            tokenGroups.Add("(" + string.Join(" OR ", grams.Select(g => "\"" + g + "\"")) + ")");
         }
-        return string.Join(" OR ", grams.Select(g => "\"" + g + "\"").Take(20));
+        return string.Join(" AND ", tokenGroups);
     }
 
     private static string Now() => DateTime.UtcNow.ToString("O");
