@@ -198,7 +198,7 @@ extension stays the primary zero-config path.
 - [x] **T17** Pi extension: expose the new tools and scope parameter; keep prompt text
       minimal so tool descriptions do not inflate every request. (Slice 5 — 14 tools;
       no automatic injection was added.)
-- [ ] **T18** HanniPI integration: bump `hannigram-version.json` and the packaged asset.
+- [x] **T18** HanniPI integration: bump `hannigram-version.json` and the packaged asset. (Slice 6 — release `v0.2.1` publicada; HanniPI pinnado a `v0.2.1` y release `v0.2.13`.)
 - [x] **T19** Docs: README (scopes, review loop, MCP), fix the committed
       `.hannigram/memory.md` that still points at another machine's db path. (Slice 5 —
       the export no longer emits an absolute database path and was regenerated.)
@@ -921,3 +921,18 @@ Observed evidence (`dotnet --version` = `10.0.401`, `node --version` = `v24.14.0
   the cap rows directly in SQLite exactly as `TimelineBoundTests` does. One revert run was also
   discarded because the Release binary had not been rebuilt after the source was restored; the
   proofs above come from runs against a freshly built binary.
+
+
+### Slice 6 — release and HanniPI integration (2026-10-15)
+
+- Rama `feat/memory-v2` empujada y fusionada a `main` (`a6748d0`), changelog cerrado en 0.2.0.
+- Release `v0.2.0` publicada por el workflow (asset + SHA256SUMS + VERSION.txt).
+- **Bug encontrado al verificar el asset**: `baseUrl()` de la extension solo leia `HANNIGRAM_URL`, no
+  `HANNIGRAM_URLS`, asi que un daemon en otro puerto se ignoraba y las llamadas caian en el de
+  siempre (un daemon viejo respondia sin `scope` y la verificacion fallaba). Arreglado en `849295d`
+  con changelog 0.2.1 y extension 0.2.1.
+- Release `v0.2.1` publicada. Verificacion end-to-end del asset publicado: daemon del asset en un
+  puerto y BD temporales + `verify-extension.mjs` -> **14 tools** y `ALL TOOLS EXECUTED OK`.
+- HanniPI: `hannigram-version.json` pinneado a `v0.2.1` (`26b6067e…`, commit `849295d`).
+- Higiene: los dos guardados de depuracion que cayeron en la BD real (por el bug) se borraron;
+  la BD del usuario queda sin residuo.
