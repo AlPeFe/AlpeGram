@@ -1,0 +1,23 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <IsPackable>false</IsPackable>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.NET.Test.Sdk" Version="17.14.1" />
+    <PackageReference Include="xunit" Version="2.9.3" />
+    <PackageReference Include="xunit.runner.visualstudio" Version="2.8.2" />
+  </ItemGroup>
+
+  <!-- The MCP server is an app, but its protocol loop (McpSession.Handle) and its
+       tool invoker are plain classes, so the suite tests them in-process: no
+       process launch, no port, no global state. -->
+  <ItemGroup>
+    <ProjectReference Include="..\..\src\HanniGram.Mcp\HanniGram.Mcp.csproj" />
+  </ItemGroup>
+
+</Project>

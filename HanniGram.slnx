@@ -2,9 +2,11 @@
   <Folder Name="/src/">
     <Project Path="src/HanniGram.Cli/HanniGram.Cli.csproj" />
     <Project Path="src/HanniGram.Core/HanniGram.Core.csproj" />
+    <Project Path="src/HanniGram.Mcp/HanniGram.Mcp.csproj" />
     <Project Path="src/HanniGram.Server/HanniGram.Server.csproj" />
   </Folder>
   <Folder Name="/tests/">
     <Project Path="tests/HanniGram.Core.Tests/HanniGram.Core.Tests.csproj" />
+    <Project Path="tests/HanniGram.Mcp.Tests/HanniGram.Mcp.Tests.csproj" />
   </Folder>
 </Solution>
