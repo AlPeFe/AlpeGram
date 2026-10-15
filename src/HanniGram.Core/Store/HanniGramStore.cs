@@ -33,7 +33,8 @@ public sealed class HanniGramStore : IDisposable
 
     // Bump when the FTS tokenizer or an indexed schema changes, to force a one-off
     // re-index. Do NOT bump on every open — that re-indexed the whole corpus per start.
-    private const int SchemaVersion = 1;
+    // v2: observations_fts gained what/why/where_/learned.
+    private const int SchemaVersion = 2;
 
     private void Initialize()
     {
@@ -85,12 +86,14 @@ public sealed class HanniGramStore : IDisposable
         // FTS5 trigram index: typo-tolerant and substring/CJK search. Built/patched ONLY
         // when the schema version advances, not on every open. The drop+recreate is
         // external-content safe (observations rows are untouched; 'rebuild' re-indexes).
+        // Column order is part of the contract: the FTS5 'delete' command used by the
+        // sync triggers must pass OLD values back in exactly this order.
         if (GetUserVersion() < SchemaVersion)
         {
             Exec("DROP TABLE IF EXISTS observations_fts;");
             Exec(@"
                 CREATE VIRTUAL TABLE observations_fts USING fts5(
-                    title, content, topic_key, type,
+                    title, content, what, why, where_, learned, topic_key, type,
                     tokenize='trigram',
                     content='observations', content_rowid='id'
                 );

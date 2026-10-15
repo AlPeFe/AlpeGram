@@ -91,4 +91,37 @@ public sealed class SearchTests
         Assert.Empty(store.Search(project.Id, "ab"));
         Assert.Single(store.Search(project.Id, "substring"));
     }
+
+    // Regression: observations_fts used to index only title/content/topic_key/type,
+    // so the richest part of a memory (what/why/where/learned) was unretrievable.
+    [Fact]
+    public void Search_IndexesStructuredFields()
+    {
+        using var db = new TempDatabase();
+        using var store = db.OpenStore();
+        var project = store.GetOrCreateProject("alpha");
+        store.SaveObservation(project.Id, "One", "plain body", what: "zephyrous");
+        store.SaveObservation(project.Id, "Two", "plain body", why: "kangarooish");
+        store.SaveObservation(project.Id, "Three", "plain body", where: "vancouverly");
+        store.SaveObservation(project.Id, "Four", "plain body", learned: "aardwolfish");
+
+        Assert.Single(store.Search(project.Id, "zephyrous"));
+        Assert.Single(store.Search(project.Id, "kangarooish"));
+        Assert.Single(store.Search(project.Id, "vancouverly"));
+        Assert.Single(store.Search(project.Id, "aardwolfish"));
+    }
+
+    [Fact]
+    public void Search_FindsTermStoredOnlyInWhat()
+    {
+        using var db = new TempDatabase();
+        using var store = db.OpenStore();
+        var project = store.GetOrCreateProject("alpha");
+        var (observation, _) = store.SaveObservation(
+            project.Id, "Generic title", "generic body", what: "zephyrous payload handling");
+
+        var hit = Assert.Single(store.Search(project.Id, "zephyrous"));
+
+        Assert.Equal(observation.Id, hit.Id);
+    }
 }
