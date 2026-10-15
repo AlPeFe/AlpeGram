@@ -17,13 +17,45 @@ const mockPi = {
 await factory(mockPi);
 console.log(`Loaded extension. Registered ${tools.size} tools: ${[...tools.keys()].join(", ")}`);
 
+// The tool list is the model-facing surface: it is asserted, not just printed, so
+// a silently dropped or renamed tool fails the verification.
+const EXPECTED_TOOLS = [
+	"mem_context",
+	"mem_current_project",
+	"mem_delete",
+	"mem_get_observation",
+	"mem_pin",
+	"mem_promote",
+	"mem_review",
+	"mem_save",
+	"mem_search",
+	"mem_session_summary",
+	"mem_state",
+	"mem_suggest_topic_key",
+	"mem_timeline",
+	"mem_update",
+];
+const registered = [...tools.keys()].sort();
+const missing = EXPECTED_TOOLS.filter((n) => !registered.includes(n));
+const extra = registered.filter((n) => !EXPECTED_TOOLS.includes(n));
+if (missing.length > 0 || extra.length > 0) {
+	throw new Error(`tool list mismatch: missing [${missing.join(", ")}], unexpected [${extra.join(", ")}]`);
+}
+
+function assert(ok, message) {
+	if (!ok) throw new Error(`assertion failed: ${message}`);
+}
+
 // Minimal fake ctx with a cwd and a ui.notify stub (tools call it on write).
 const ctx = { cwd: "C:/Users/alexlocal/projects/AlpefePI", ui: { notify: () => {} } };
+// A second project, to prove a global memory saved from one cwd is retrievable
+// from another one.
+const otherProject = { cwd: "C:/Users/alexlocal/projects/KwyjiboHarness", ui: { notify: () => {} } };
 
-async function run(name, params) {
+async function run(name, params, context = ctx) {
 	const t = tools.get(name);
 	if (!t) throw new Error(`tool ${name} not registered`);
-	const res = await t.execute("test-id", params, undefined, undefined, ctx);
+	const res = await t.execute("test-id", params, undefined, undefined, context);
 	const text = res.content?.map((c) => c.text).join("\n") ?? "";
 	console.log(`\n### ${name} ${JSON.stringify(params)}\n${text}`);
 	return res;
@@ -32,7 +64,7 @@ async function run(name, params) {
 // 1. current project
 await run("mem_current_project", {});
 // 2. save
-await run("mem_save", {
+const saved = await run("mem_save", {
 	title: "Verification observation",
 	content: "HanniGram Pi extension verified end-to-end via jiti harness",
 	what: "Ran verification",
@@ -42,6 +74,8 @@ await run("mem_save", {
 	topicKey: "verification/integration",
 	type: "discovery",
 });
+const savedId = saved.details?.id;
+assert(savedId !== undefined, "mem_save did not return an observation id");
 // 3. search
 await run("mem_search", { query: "verification" });
 // 4. context
@@ -56,4 +90,80 @@ await run("mem_session_summary", {
 	sessionId: "verify-sess",
 });
 
+// ---------------------------------------------------------------------------
+// Slice 5 — the scope/lifecycle surface
+// ---------------------------------------------------------------------------
+
+// 7. global scope: a heuristic written once, shared by every project
+const globalSaved = await run("mem_save", {
+	title: "Global heuristic check",
+	content: "kestrelheuristic marker for the shared cross-project scope",
+	topicKey: "verification/global-heuristic",
+	type: "pattern",
+	scope: "global",
+});
+assert(
+	globalSaved.content?.[0]?.text?.includes("(global)"),
+	"mem_save scope=global did not report the global scope",
+);
+
+// 8. cross-scope search from ANOTHER project: the global hit must be visible and
+//    labelled with its origin
+const crossHit = await run("mem_search", { query: "kestrelheuristic", scope: "all" }, otherProject);
+assert(
+	crossHit.details?.some((h) => h.scope === "global"),
+	"scope=all search from another project did not return the global hit",
+);
+assert(
+	crossHit.content?.[0]?.text?.includes("(global)"),
+	"the cross-project hit was not labelled with its origin",
+);
+
+// 9. update: mem_update edits the row in place
+const updated = await run("mem_update", {
+	id: savedId,
+	learned: "juniperstate updated by mem_update",
+});
+assert(
+	updated.content?.[0]?.text?.startsWith("Updated observation"),
+	"mem_update did not report an update",
+);
+
+// 10. a project observation to promote
+const promotable = await run("mem_save", {
+	title: "Promotable project memory",
+	content: "quartzpromote marker, a lesson that turned out to be generic",
+	topicKey: "verification/promotable",
+	type: "pattern",
+});
+
+// 11. lifecycle: flag it for review
+const flagged = await run("mem_state", { id: promotable.details?.id, state: "needs_review" });
+assert(
+	flagged.content?.[0]?.text?.includes("needs_review"),
+	"mem_state did not set needs_review",
+);
+
+// 12. the review listing is bounded and includes the flagged row
+const review = await run("mem_review", { scope: "all" });
+assert(
+	review.details?.some((i) => i.id === promotable.details?.id),
+	"mem_review did not list the row flagged needs_review",
+);
+
+// 13. promote: the project memory moves into the shared scope
+const promoted = await run("mem_promote", { id: promotable.details?.id });
+assert(
+	promoted.content?.[0]?.text?.includes("moved"),
+	"mem_promote did not report the move",
+);
+
+// 14. pin: only pinned global heuristics enter the automatic context budget
+const pinned = await run("mem_pin", { id: globalSaved.details?.id, pinned: true, scope: "global" });
+assert(
+	pinned.content?.[0]?.text?.includes("pinned: true"),
+	"mem_pin did not pin the global heuristic",
+);
+
+console.log(`\nTool list matches the expected ${EXPECTED_TOOLS.length} tools.`);
 console.log("\nALL TOOLS EXECUTED OK");

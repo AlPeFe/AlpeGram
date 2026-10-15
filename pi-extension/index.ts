@@ -45,6 +45,20 @@ async function api<T>(path: string, init?: RequestInit): Promise<T> {
 	return (await res.json()) as T;
 }
 
+/** Like api(), but a 404 comes back as null so a missing row is a result, not an error. */
+async function apiOrMissing<T>(path: string, init?: RequestInit): Promise<T | null> {
+	const res = await fetch(`${baseUrl()}${path}`, {
+		...init,
+		headers: { "content-type": "application/json", ...(init?.headers ?? {}) },
+	});
+	if (res.status === 404) return null;
+	if (!res.ok) {
+		const body = await res.text().catch(() => "");
+		throw new Error(`HanniGram ${res.status}: ${body || res.statusText}`);
+	}
+	return (await res.json()) as T;
+}
+
 /** Build the query string carrying the project scope from the session cwd. */
 function scope(cwd: string, extra: Record<string, string> = {}): string {
 	const p = new URLSearchParams({ cwd, ...extra });
@@ -151,7 +165,7 @@ export default function (pi: ExtensionAPI) {
 		name: "mem_save",
 		label: "HanniGram: save memory",
 		description:
-			"Save a durable, structured memory observation for the CURRENT project (scoped by git remote). Two kinds of memory, both per-project: (1) decisions & conventions the agent must RESPECT — set type='adr' so they are always surfaced to the agent; (2) context/ideas in progress — discoveries, patterns, bugfixes, config, concepts being worked on (any other type). Capture durable knowledge, never raw tool output or every turn. Give a short searchable title.",
+			"Save a durable, structured memory observation for the CURRENT project (scoped by git remote). Two kinds of memory: (1) decisions & conventions the agent must RESPECT — set type='adr' so they are always surfaced to the agent; (2) context/ideas in progress — discoveries, patterns, bugfixes, config, concepts being worked on (any other type). Set scope='global' only for a heuristic that repeats across many projects. Capture durable knowledge, never raw tool output or every turn. Give a short searchable title.",
 		parameters: Type.Object({
 			title: Type.String({ description: "Short, searchable title of the observation" }),
 			content: Type.String({ description: "The full observation content" }),
@@ -165,28 +179,36 @@ export default function (pi: ExtensionAPI) {
 			type: Type.Optional(
 				Type.String({ description: "Observation type. Two buckets per project: 'adr' = decision/convention the agent must respect (always surfaced); anything else ('discovery', 'idea', 'pattern', 'bugfix', ...) = context/idea being worked on." }),
 			),
+			scope: Type.Optional(
+				Type.String({ description: "Where to write: 'project' (default, this repo) or 'global' (shared by every project)." }),
+			),
 		}),
 		execute: async (_id, params, _signal, _onUpdate, ctx: ExtensionToolContext) => {
 			await ensureDaemon();
-			const res = await api<{ observation: { id: number; title: string; topicKey?: string }; created: boolean }>(
-				`/api/observations?${scope(ctx.cwd)}`,
-				{
-					method: "POST",
-					body: JSON.stringify(params),
-				},
-			);
-			const { observation: obs, created } = res;
+			const res = await api<{
+				observation: { id: number; title: string; topicKey?: string };
+				created: boolean;
+				scope: string;
+				review?: { kind: string; id: number; title: string };
+			}>(`/api/observations?${scope(ctx.cwd)}`, {
+				method: "POST",
+				body: JSON.stringify(params),
+			});
+			const { observation: obs, created, review } = res;
 			ctx.ui.notify(
 				created
 					? `✓ Memoria guardada #${obs.id}: ${obs.title}${obs.topicKey ? ` [${obs.topicKey}]` : ""}`
 					: `✎ Memoria actualizada #${obs.id}: ${obs.title}${obs.topicKey ? ` [${obs.topicKey}]` : ""}`,
 				"info",
 			);
+			// The daemon's compact review hint (a few tokens, never a body) tells the
+			// model the save collided with something it may now want to review.
+			const hint = review ? `\nreview: ${review.kind} #${review.id} ${review.title}` : "";
 			return {
 				content: [
 					{
 						type: "text",
-						text: `${created ? "Saved" : "Updated"} observation #${obs.id}: ${obs.title}${obs.topicKey ? ` [topic: ${obs.topicKey}]` : ""}`,
+						text: `${created ? "Saved" : "Updated"} observation #${obs.id} (${res.scope}): ${obs.title}${obs.topicKey ? ` [topic: ${obs.topicKey}]` : ""}${hint}`,
 					},
 				],
 				details: obs,
@@ -230,19 +252,25 @@ export default function (pi: ExtensionAPI) {
 		name: "mem_search",
 		label: "HanniGram: search memory",
 		description:
-			"Full-text search over the current project's memory (SQLite FTS5). Use before revisiting a decision, bug, convention, or request that may already be known. Results are previews, not the complete record.",
+			"Full-text search over memory (SQLite FTS5). scope='all' (default) covers the project and the shared global memory, and every hit shows its origin. Use before revisiting a decision, bug, convention, or request that may already be known. Results are previews, not the complete record.",
 		parameters: Type.Object({
 			query: Type.String({ description: "Search terms; all terms must match" }),
 			limit: Type.Optional(Type.Number({ description: "Max results (default 10)" })),
 			type: Type.Optional(Type.String({ description: "Filter by observation type (e.g. 'adr', 'decision', 'bugfix', 'pattern')" })),
 			topicKey: Type.Optional(Type.String({ description: "Restrict to a single topic key, e.g. 'ui/palette'" })),
+			scope: Type.Optional(
+				Type.String({ description: "Namespaces to search: 'project', 'global', or 'all' (default). Each hit is labelled with its origin." }),
+			),
 		}),
 		execute: async (_id, params, _signal, _onUpdate, ctx: ExtensionToolContext) => {
 			await ensureDaemon();
-			const hits = await api<Array<{ id: number; title: string; content: string; topicKey?: string; type?: string }>>(
+			const hits = await api<
+				Array<{ id: number; title: string; content: string; topicKey?: string; type?: string; scope?: string }>
+			>(
 				`/api/search?${scope(ctx.cwd, {
 					q: params.query,
 					limit: String(params.limit ?? 10),
+					scope: params.scope ?? "all",
 					...(params.type ? { type: params.type } : {}),
 					...(params.topicKey ? { topicKey: params.topicKey } : {}),
 				})}`,
@@ -251,7 +279,7 @@ export default function (pi: ExtensionAPI) {
 				return { content: [{ type: "text", text: "No memory matches." }], details: [] };
 			}
 			const text = hits
-				.map((h) => `#${h.id} ${h.title}${h.topicKey ? ` [${h.topicKey}]` : ""}\n  ${h.content}`)
+				.map((h) => `#${h.id} (${h.scope ?? "project"}) ${h.title}${h.topicKey ? ` [${h.topicKey}]` : ""}\n  ${h.content}`)
 				.join("\n");
 			return { content: [{ type: "text", text }], details: hits };
 		},
@@ -378,6 +406,178 @@ export default function (pi: ExtensionAPI) {
 				content: [{ type: "text", text: `Session ${sessionId} summary saved.` }],
 				details: { sessionId },
 			};
+		},
+	});
+
+	// ------------------------------------------------------------------
+	// mem_update — edit an observation in place
+	// ------------------------------------------------------------------
+	pi.registerTool({
+		name: "mem_update",
+		label: "HanniGram: update memory",
+		description:
+			"Edit an existing observation by id. Only the fields you pass change; an empty string clears one. Use it to correct or extend memory instead of saving a near-duplicate.",
+		parameters: Type.Object({
+			id: Type.Number({ description: "Observation id" }),
+			title: Type.Optional(Type.String({ description: "New title" })),
+			content: Type.Optional(Type.String({ description: "New content" })),
+			what: Type.Optional(Type.String({ description: "New 'what'; empty string clears it" })),
+			why: Type.Optional(Type.String({ description: "New 'why'; empty string clears it" })),
+			where: Type.Optional(Type.String({ description: "New 'where'; empty string clears it" })),
+			learned: Type.Optional(Type.String({ description: "New 'learned'; empty string clears it" })),
+			topicKey: Type.Optional(Type.String({ description: "New topic key; empty string clears it" })),
+			type: Type.Optional(Type.String({ description: "New type; empty string clears it" })),
+			scope: Type.Optional(
+				Type.String({ description: "Namespace that owns the row: 'project' (default) or 'global'." }),
+			),
+		}),
+		execute: async (_id, params, _signal, _onUpdate, ctx: ExtensionToolContext) => {
+			await ensureDaemon();
+			const { id, scope: rowScope, ...fields } = params;
+			const obs = await apiOrMissing<{ id: number; title: string; state?: string }>(
+				`/api/observations/${id}?${scope(ctx.cwd, rowScope ? { scope: rowScope } : {})}`,
+				{ method: "PUT", body: JSON.stringify(fields) },
+			);
+			if (!obs) {
+				ctx.ui.notify(`✗ Memoria #${id} no encontrada`, "warning");
+				return { content: [{ type: "text", text: `Observation #${id} not found.` }], details: { updated: false } };
+			}
+			ctx.ui.notify(`✎ Memoria actualizada #${obs.id}: ${obs.title}`, "info");
+			return { content: [{ type: "text", text: `Updated observation #${obs.id}: ${obs.title}` }], details: obs };
+		},
+	});
+
+	// ------------------------------------------------------------------
+	// mem_review — bounded review listing
+	// ------------------------------------------------------------------
+	pi.registerTool({
+		name: "mem_review",
+		label: "HanniGram: review memory",
+		description:
+			"List memory that needs attention: rows flagged needs_review plus near-duplicate candidates, with truncated previews. Follow up with mem_update, mem_state or mem_delete.",
+		parameters: Type.Object({
+			limit: Type.Optional(Type.Number({ description: "Max items (default 20)" })),
+			scope: Type.Optional(
+				Type.String({ description: "Namespaces to review: 'project', 'global', or 'all' (default)." }),
+			),
+		}),
+		execute: async (_id, params, _signal, _onUpdate, ctx: ExtensionToolContext) => {
+			await ensureDaemon();
+			const items = await api<
+				Array<{ kind: string; id: number; scope?: string; title: string; preview: string; duplicateOfId?: number }>
+			>(
+				`/api/review?${scope(ctx.cwd, {
+					limit: String(params.limit ?? 20),
+					...(params.scope ? { scope: params.scope } : {}),
+				})}`,
+			);
+			if (items.length === 0) {
+				return { content: [{ type: "text", text: "Nothing to review." }], details: [] };
+			}
+			const text = items
+				.map(
+					(i) =>
+						`[${i.kind}] #${i.id} (${i.scope ?? "project"}) ${i.title}`
+						+ (i.duplicateOfId ? ` ~ duplicate of #${i.duplicateOfId}` : "")
+						+ `\n  ${i.preview}`,
+				)
+				.join("\n");
+			return { content: [{ type: "text", text }], details: items };
+		},
+	});
+
+	// ------------------------------------------------------------------
+	// mem_promote — promote a project memory to the global scope
+	// ------------------------------------------------------------------
+	pi.registerTool({
+		name: "mem_promote",
+		label: "HanniGram: promote memory",
+		description:
+			"Promote a project observation to the shared global memory when the lesson turned out to repeat across projects. If the topic key already exists globally, the promoted content overwrites that row.",
+		parameters: Type.Object({
+			id: Type.Number({ description: "Observation id in the current project" }),
+		}),
+		execute: async (_id, params, _signal, _onUpdate, ctx: ExtensionToolContext) => {
+			await ensureDaemon();
+			const res = await apiOrMissing<{
+				observation: { id: number; title: string };
+				merged: boolean;
+				outcome: string;
+			}>(`/api/observations/${params.id}/promote?${scope(ctx.cwd)}`, { method: "POST" });
+			if (!res) {
+				ctx.ui.notify(`✗ Memoria #${params.id} no encontrada`, "warning");
+				return { content: [{ type: "text", text: `Observation #${params.id} not found.` }], details: { promoted: false } };
+			}
+			ctx.ui.notify(`✓ Memoria promovida #${res.observation.id} → global (${res.outcome})`, "info");
+			return {
+				content: [
+					{
+						type: "text",
+						text: `Promoted #${res.observation.id} to global (${res.outcome}): ${res.observation.title}`,
+					},
+				],
+				details: res,
+			};
+		},
+	});
+
+	// ------------------------------------------------------------------
+	// mem_state — lifecycle state
+	// ------------------------------------------------------------------
+	pi.registerTool({
+		name: "mem_state",
+		label: "HanniGram: set lifecycle state",
+		description:
+			"Set an observation's lifecycle state: 'active', 'needs_review' or 'archived'. Archiving is the safe forget — the row is kept but excluded from default reads.",
+		parameters: Type.Object({
+			id: Type.Number({ description: "Observation id" }),
+			state: Type.String({ description: "New state: 'active', 'needs_review' or 'archived'" }),
+			scope: Type.Optional(
+				Type.String({ description: "Namespace that owns the row: 'project' (default) or 'global'." }),
+			),
+		}),
+		execute: async (_id, params, _signal, _onUpdate, ctx: ExtensionToolContext) => {
+			await ensureDaemon();
+			const obs = await apiOrMissing<{ id: number; title: string; state: string }>(
+				`/api/observations/${params.id}/state?${scope(ctx.cwd, params.scope ? { scope: params.scope } : {})}`,
+				{ method: "POST", body: JSON.stringify({ state: params.state }) },
+			);
+			if (!obs) {
+				ctx.ui.notify(`✗ Memoria #${params.id} no encontrada o estado inválido`, "warning");
+				return { content: [{ type: "text", text: `Observation #${params.id} not found.` }], details: { updated: false } };
+			}
+			ctx.ui.notify(`✓ Memoria #${obs.id} → ${obs.state}`, "info");
+			return { content: [{ type: "text", text: `Observation #${obs.id} state: ${obs.state}` }], details: obs };
+		},
+	});
+
+	// ------------------------------------------------------------------
+	// mem_pin — pin / unpin an observation
+	// ------------------------------------------------------------------
+	pi.registerTool({
+		name: "mem_pin",
+		label: "HanniGram: pin memory",
+		description:
+			"Pin or unpin an observation. Pinned global heuristics are the only global memory that enters the automatic context budget (at most 3).",
+		parameters: Type.Object({
+			id: Type.Number({ description: "Observation id" }),
+			pinned: Type.Boolean({ description: "true to pin, false to unpin" }),
+			scope: Type.Optional(
+				Type.String({ description: "Namespace that owns the row: 'project' (default) or 'global'." }),
+			),
+		}),
+		execute: async (_id, params, _signal, _onUpdate, ctx: ExtensionToolContext) => {
+			await ensureDaemon();
+			const obs = await apiOrMissing<{ id: number; title: string; pinned: boolean }>(
+				`/api/observations/${params.id}/pin?${scope(ctx.cwd, params.scope ? { scope: params.scope } : {})}`,
+				{ method: "POST", body: JSON.stringify({ pinned: params.pinned }) },
+			);
+			if (!obs) {
+				ctx.ui.notify(`✗ Memoria #${params.id} no encontrada`, "warning");
+				return { content: [{ type: "text", text: `Observation #${params.id} not found.` }], details: { updated: false } };
+			}
+			ctx.ui.notify(`✓ Memoria #${obs.id} pinned=${obs.pinned}`, "info");
+			return { content: [{ type: "text", text: `Observation #${obs.id} pinned: ${obs.pinned}` }], details: obs };
 		},
 	});
 }
