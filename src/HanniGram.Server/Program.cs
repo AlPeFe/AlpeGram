@@ -2,6 +2,7 @@ using System.Text.Json;
 using System.Text.Json.Serialization;
 using HanniGram.Core.Models;
 using HanniGram.Core.Store;
+using Microsoft.AspNetCore.Diagnostics;
 
 var builder = WebApplication.CreateBuilder(args);
 
@@ -21,6 +22,29 @@ var json = new JsonSerializerOptions(JsonSerializerDefaults.Web)
 {
     DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull,
 };
+
+// An unhandled exception used to surface as a bare, bodiless 500, which the CLI
+// and the harness could not parse. Return a small JSON envelope instead and log
+// the exception server-side: stack traces and messages never leave the process.
+app.UseExceptionHandler(errorApp =>
+{
+    errorApp.Run(async context =>
+    {
+        var feature = context.Features.Get<IExceptionHandlerFeature>();
+        var logger = context.RequestServices
+            .GetRequiredService<ILoggerFactory>()
+            .CreateLogger("HanniGram.Server");
+        logger.LogError(feature?.Error, "Unhandled exception while handling {Method} {Path}",
+            context.Request.Method, context.Request.Path);
+
+        context.Response.StatusCode = StatusCodes.Status500InternalServerError;
+        context.Response.ContentType = "application/json; charset=utf-8";
+        var payload = JsonSerializer.Serialize(
+            new { error = "internal_error", message = "The daemon failed to handle the request." },
+            json);
+        await context.Response.WriteAsync(payload);
+    });
+});
 
 // Resolve a project from a cwd (or explicit name). Mirrors engram's resolution:
 // explicit project > HANNIGRAM_CWD > cwd detection.

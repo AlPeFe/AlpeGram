@@ -58,4 +58,37 @@ public sealed class SearchTests
         Assert.Single(hits);
         Assert.Equal("architecture", hits[0].Type);
     }
+
+    // Regression: FtsQuery drops terms shorter than 3 chars, so these queries used
+    // to escape to an empty expression and blow up on `MATCH ''` with
+    // `fts5: syntax error near ""` (HTTP 500 on /api/search).
+    [Theory]
+    [InlineData("ab")]
+    [InlineData("a")]
+    [InlineData("")]
+    [InlineData("   ")]
+    [InlineData("\t\t\t")]
+    public void Search_QueryWithoutSearchableTerm_ReturnsEmptyWithoutThrowing(string query)
+    {
+        using var db = new TempDatabase();
+        using var store = db.OpenStore();
+        var project = store.GetOrCreateProject("alpha");
+        store.SaveObservation(project.Id, "Some title", "some reasonably long content about things");
+
+        var hits = store.Search(project.Id, query);
+
+        Assert.Empty(hits);
+    }
+
+    [Fact]
+    public void Search_AfterShortQuery_StillWorksForValidQuery()
+    {
+        using var db = new TempDatabase();
+        using var store = db.OpenStore();
+        var project = store.GetOrCreateProject("alpha");
+        store.SaveObservation(project.Id, "Some title", "searchable substring here");
+
+        Assert.Empty(store.Search(project.Id, "ab"));
+        Assert.Single(store.Search(project.Id, "substring"));
+    }
 }

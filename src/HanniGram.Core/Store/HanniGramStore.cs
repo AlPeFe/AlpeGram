@@ -307,14 +307,29 @@ public sealed class HanniGramStore : IDisposable
     {
         lock (_gate)
         {
-            var hits = SearchCore(projectId, FtsQuery(query), limit, type, topicKey);
+            // FtsQuery drops every term shorter than the trigram minimum, so "ab",
+            // "a", "" and whitespace-only all escape to the empty string. FTS5
+            // rejects MATCH '' with `fts5: syntax error near ""`, which used to
+            // bubble up as an HTTP 500. A query with no searchable term has no hits
+            // by definition, so return early instead of touching the index.
+            var ftsQuery = FtsQuery(query);
+            if (ftsQuery.Length == 0)
+            {
+                return Array.Empty<SearchHit>();
+            }
+
+            var hits = SearchCore(projectId, ftsQuery, limit, type, topicKey);
             // Trigram tokenizer matches substrings, not fuzzy typos. When a strict
             // AND match finds nothing, retry with OR of the query's trigrams so a
             // typo'd word (1-3 chars off in a long word) still matches documents
             // sharing enough trigrams, ranked by bm25.
             if (hits.Count == 0 && query.Where(char.IsLetterOrDigit).Count() >= 6)
             {
-                hits = SearchCore(projectId, FtsTrigramFallback(query), limit, type, topicKey);
+                var fallback = FtsTrigramFallback(query);
+                if (fallback.Length != 0)
+                {
+                    hits = SearchCore(projectId, fallback, limit, type, topicKey);
+                }
             }
             return hits;
         }
@@ -323,6 +338,12 @@ public sealed class HanniGramStore : IDisposable
     private List<SearchHit> SearchCore(long projectId, string ftsQuery, int limit, string? type = null, string? topicKey = null)
     {
         var list = new List<SearchHit>();
+        // Hard guarantee for every caller, including the trigram fallback: an FTS5
+        // MATCH is never issued with an empty expression.
+        if (string.IsNullOrEmpty(ftsQuery))
+        {
+            return list;
+        }
         using var cmd = _conn.CreateCommand();
         var sql = @"
             SELECT o.id, o.title, o.content, o.topic_key, o.type, o.created_at_utc, bm25(observations_fts) AS rank
@@ -456,7 +477,9 @@ public sealed class HanniGramStore : IDisposable
         // require all terms (closer to a focused search). Trigram tokenizer
         // matches substrings of >=3 chars; drop 1-2-char terms (they would
         // match nothing / could error) so a typo'd fragment still finds data.
-        var terms = raw.Split(' ', StringSplitOptions.RemoveEmptyEntries)
+        // Split on any whitespace so a whitespace-only query (tabs, newlines)
+        // also collapses to "no terms" instead of becoming a MATCH expression.
+        var terms = raw.Split(new[] { ' ', '\t', '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries)
             .Where(t => t.Length >= 3)
             .Select(t => "\"" + t.Replace("\"", "\"\"") + "\"");
         return string.Join(" AND ", terms);
