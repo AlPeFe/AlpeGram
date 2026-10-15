@@ -1,7 +1,7 @@
 {
   "name": "hannigram-pi-extension",
   "private": true,
-  "version": "0.1.0",
+  "version": "0.2.0",
   "type": "module",
   "description": "Native Pi extension for HanniGram: registers mem_* tools that talk to the HanniGram daemon over HTTP. No MCP.",
   "scripts": {
