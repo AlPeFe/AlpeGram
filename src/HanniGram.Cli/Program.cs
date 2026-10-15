@@ -1,4 +1,6 @@
-﻿using HanniGram.Core.Store;
+﻿using HanniGram.Core.Cli;
+using HanniGram.Core.Store;
+using static HanniGram.Core.Cli.CwdResolver;
 
 // HanniGram CLI — use the engine standalone, without the daemon.
 // Usage:
@@ -22,7 +24,8 @@ if (cliArgs.Length == 0) { Help(); return; }
 var cmd = cliArgs[0];
 var rest = cliArgs.Skip(1).ToArray();
 var project = Flag(rest, "--project");
-var cwd = Flag(rest, "--cwd") ?? Directory.GetCurrentDirectory();
+// Resolution order: --cwd, then HANNIGRAM_CWD, then the current directory.
+var cwd = CwdResolver.Resolve(rest, Env("HANNIGRAM_CWD"), Directory.GetCurrentDirectory());
 var resolvedProject = project ?? ProjectResolver.Resolve(cwd);
 
 try
@@ -30,8 +33,13 @@ try
     switch (cmd)
     {
         case "project":
-            Console.WriteLine(resolvedProject);
+        {
+            // `hannigram project [cwd]` honours its positional cwd argument; the
+            // --cwd flag / HANNIGRAM_CWD / current directory apply when it is absent.
+            var projectCwd = CwdResolver.Positional(rest) ?? cwd;
+            Console.WriteLine(project ?? ProjectResolver.Resolve(projectCwd));
             break;
+        }
 
         case "init":
         {
@@ -139,12 +147,7 @@ catch (Exception ex)
 
 static string? Env(string name) => Environment.GetEnvironmentVariable(name);
 static string[] Args() => Environment.GetCommandLineArgs().Skip(1).ToArray();
-static string? Flag(string[] a, string name)
-{
-    for (var i = 0; i < a.Length - 1; i++)
-        if (a[i] == name) return a[i + 1];
-    return null;
-}
+// Flag(...) is CwdResolver.Flag, imported with `using static` above.
 static int IntFlag(string[] a, string name, int def)
     => int.TryParse(Flag(a, name), out var v) ? v : def;
 static string Truncate(string s, int n) => s.Length <= n ? s : s[..n] + "…";
