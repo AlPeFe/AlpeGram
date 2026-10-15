@@ -8,6 +8,7 @@ using static HanniGram.Core.Cli.CwdResolver;
 //   hannigram project [cwd]                 resolve project for a cwd
 //   hannigram init [--cwd]                  init project memory (BD + .hannigram/memory.md local export)
 //   hannigram save <title> [--content] [--what] [--why] [--where] [--learned] [--topic] [--type] [--scope] [--project] [--cwd]
+//   hannigram update <id> [--title] [--content] [--what] [--why] [--where] [--learned] [--topic] [--type] [--scope] [--project] [--cwd]
 //   hannigram state <id> --set active|needs_review|archived [--scope] [--project] [--cwd]
 //   hannigram pin <id> [--off] [--scope] [--project] [--cwd]
 //   hannigram search <query> [--limit] [--state] [--scope] [--project] [--cwd]
@@ -117,6 +118,29 @@ try
             var limit = IntFlag(rest, "--limit", 50);
             foreach (var obs in store.ListObservations(p.Id, limit, Flag(rest, "--state")))
                 Console.WriteLine($"#{obs.Id} [{obs.TopicKey ?? "-"}] {obs.Title} ({obs.CreatedAtUtc:yyyy-MM-dd})");
+            break;
+        }
+
+        case "update":
+        {
+            // Update an observation by id (the mem_update contract). Nullable flags:
+            // an absent flag leaves the field unchanged; --what "" clears it.
+            var id = long.Parse(Positional(rest) ?? throw new ArgumentException("id required"));
+            var scope = MemoryScopes.ResolveScope(Flag(rest, "--scope"), MemoryScopes.Project);
+            var p = scope == MemoryScopes.Global
+                ? store.GetOrCreateGlobalProject()
+                : store.GetOrCreateProject(resolvedProject, cwd);
+            var updated = store.UpdateObservation(p.Id, id,
+                Flag(rest, "--title"), Flag(rest, "--content"),
+                Flag(rest, "--what"), Flag(rest, "--why"), Flag(rest, "--where"),
+                Flag(rest, "--learned"), Flag(rest, "--topic"), Flag(rest, "--type"));
+            if (updated is null)
+            {
+                Console.Error.WriteLine($"error: observation #{id} not found in scope {scope}");
+                Environment.ExitCode = 1;
+                break;
+            }
+            Console.WriteLine($"updated #{updated.Id} [{p.Name}] ({scope}) {updated.Title}");
             break;
         }
 
@@ -230,6 +254,7 @@ static void Help() => Console.WriteLine("""
     Usage:
       hannigram project [cwd]
       hannigram save <title> [--content] [--what] [--why] [--where] [--learned] [--topic] [--type] [--scope project|global] [--project] [--cwd]
+      hannigram update <id> [--title] [--content] [--what] [--why] [--where] [--learned] [--topic] [--type] [--scope project|global] [--project] [--cwd]
       hannigram state <id> --set active|needs_review|archived [--scope project|global] [--project] [--cwd]
       hannigram pin <id> [--off] [--scope project|global] [--project] [--cwd]
       hannigram search <query> [--limit] [--state active|needs_review|archived|all] [--scope project|global|all] [--project] [--cwd]

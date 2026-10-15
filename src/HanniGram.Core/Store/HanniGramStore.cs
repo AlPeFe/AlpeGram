@@ -977,6 +977,82 @@ public sealed class HanniGramStore : IDisposable
     }
 
     /// <summary>
+    /// Update an observation by id. Nullable overrides: null leaves a field
+    /// unchanged, a non-null value (including an empty string) sets it.
+    /// <c>created_at_utc</c> is preserved; <c>updated_at_utc</c> moves. The write is
+    /// scoped to <paramref name="projectId"/>, so an update can never reach into
+    /// another project (or the global namespace) by id — a cross-project id returns
+    /// null.
+    /// <para>
+    /// topic_key follows the same deciding rule as a save: at most one row owns a
+    /// given key per namespace. When the new key is already owned by another row in
+    /// the same namespace, THE UPDATED ROW WINS the key and the other row is
+    /// unkeyed. This keeps the key single-valued without deleting anything, and it
+    /// matches the "latest teaching wins" behaviour of the upsert path.
+    /// </para>
+    /// </summary>
+    public Observation? UpdateObservation(long projectId, long id,
+        string? title = null, string? content = null,
+        string? what = null, string? why = null, string? where = null, string? learned = null,
+        string? topicKey = null, string? type = null)
+    {
+        lock (_gate)
+        {
+            var scope = ScopeOfProject(projectId);
+            using var tx = _conn.BeginTransaction();
+            var existing = ReadObservationById(projectId, id, tx);
+            if (existing is null)
+            {
+                tx.Commit();
+                return null;
+            }
+
+            var newTopicKey = topicKey is null
+                ? existing.TopicKey
+                : (string.IsNullOrEmpty(topicKey) ? null : topicKey);
+
+            // Keep at most one owner of a topic key per namespace: the updated row
+            // takes the key and any other row in the same namespace that held it is
+            // unkeyed. Deterministic and non-destructive (nothing is deleted).
+            if (!string.IsNullOrEmpty(newTopicKey))
+            {
+                using var clear = CreateCommand(tx);
+                clear.CommandText = "UPDATE observations SET topic_key = NULL WHERE project_id = $p AND topic_key = $tk AND id <> $id";
+                clear.Parameters.AddWithValue("$p", projectId);
+                clear.Parameters.AddWithValue("$tk", newTopicKey);
+                clear.Parameters.AddWithValue("$id", id);
+                clear.ExecuteNonQuery();
+            }
+
+            using (var cmd = CreateCommand(tx))
+            {
+                cmd.CommandText = @"
+                    UPDATE observations
+                    SET title = $t, content = $c, what = $w, why = $y, where_ = $wh, learned = $l,
+                        topic_key = $tk, type = $ty, updated_at_utc = $n
+                    WHERE id = $id AND project_id = $p";
+                cmd.Parameters.AddWithValue("$t", title ?? existing.Title);
+                cmd.Parameters.AddWithValue("$c", content ?? existing.Content);
+                cmd.Parameters.AddWithValue("$w", (object?)(what ?? existing.What) ?? DBNull.Value);
+                cmd.Parameters.AddWithValue("$y", (object?)(why ?? existing.Why) ?? DBNull.Value);
+                cmd.Parameters.AddWithValue("$wh", (object?)(where ?? existing.Where) ?? DBNull.Value);
+                cmd.Parameters.AddWithValue("$l", (object?)(learned ?? existing.Learned) ?? DBNull.Value);
+                cmd.Parameters.AddWithValue("$tk", (object?)newTopicKey ?? DBNull.Value);
+                cmd.Parameters.AddWithValue("$ty", (object?)(type ?? existing.Type) ?? DBNull.Value);
+                cmd.Parameters.AddWithValue("$n", Now());
+                cmd.Parameters.AddWithValue("$id", id);
+                cmd.Parameters.AddWithValue("$p", projectId);
+                cmd.ExecuteNonQuery();
+            }
+
+            var updated = ReadObservationById(projectId, id, tx)!;
+            tx.Commit();
+            updated.Scope = scope;
+            return updated;
+        }
+    }
+
+    /// <summary>
     /// Bounded review listing: rows flagged <c>needs_review</c> plus duplicate
     /// candidates, with truncated previews and a hard cap. The response never
     /// carries an observation body.

@@ -128,6 +128,17 @@ app.MapPost("/api/observations/{id:long}/pin", (long id, HttpRequest req, Observ
     return obs is null ? Results.NotFound() : Results.Json(obs, json);
 });
 
+// Update an observation by id (T20 / mem_update). Null fields are left unchanged;
+// created_at_utc is preserved and updated_at_utc moves. Scoped by namespace, so a
+// cross-project update is refused with 404.
+app.MapPut("/api/observations/{id:long}", (long id, HttpRequest req, ObservationUpdateBody body) =>
+{
+    var projectId = ProjectIdForWrite(req, body.Scope ?? req.Query["scope"].FirstOrDefault());
+    var obs = store.UpdateObservation(projectId, id,
+        body.Title, body.Content, body.What, body.Why, body.Where, body.Learned, body.TopicKey, body.Type);
+    return obs is null ? Results.NotFound() : Results.Json(obs, json);
+});
+
 app.MapGet("/api/observations/{id:long}", (long id, HttpRequest req) =>
 {
     var p = ResolveProject(req);
@@ -239,6 +250,21 @@ public sealed class SessionEndBody
     public string? Summary { get; set; }
     public string? Goal { get; set; }
     public string? NextSteps { get; set; }
+}
+
+/// <summary>Body for <c>PUT /api/observations/{id}</c> (T20). Null fields are left unchanged.</summary>
+public sealed class ObservationUpdateBody
+{
+    public string? Title { get; set; }
+    public string? Content { get; set; }
+    public string? What { get; set; }
+    public string? Why { get; set; }
+    public string? Where { get; set; }
+    public string? Learned { get; set; }
+    public string? TopicKey { get; set; }
+    public string? Type { get; set; }
+    /// <summary>Namespace of the row: "project" (default) or "global".</summary>
+    public string? Scope { get; set; }
 }
 
 /// <summary>Body for <c>POST /api/observations/{id}/state</c> (T13/T15).</summary>
