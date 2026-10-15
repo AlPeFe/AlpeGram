@@ -329,16 +329,27 @@ public sealed class MemoryToolInvoker
     private (JsonObject, bool) Promote(JsonElement args)
     {
         var id = RequiredLong(args, "id");
+        var allowArchived = OptionalBool(args, "allowArchived") ?? false;
         var project = _projects.ResolveProject(OptionalString(args, "project"));
-        var result = _store.PromoteObservation(project.Id, id);
+        var result = _store.PromoteObservation(project.Id, id, allowArchived);
         if (result is null) return NotFound(id, MemoryScopes.Project);
+        if (result.Outcome == PromotionOutcomes.Refused)
+        {
+            // A refusal is a value the model can act on (retry with allowArchived),
+            // so it stays inside the result instead of becoming a protocol error.
+            return (new JsonObject
+            {
+                ["outcome"] = result.Outcome,
+                ["reason"] = result.Reason,
+                ["error"] = $"Refused: the observation is '{MemoryStates.Archived}'. Pass allowArchived=true to promote it anyway; the promoted row will stay archived.",
+            }, true);
+        }
 
-        var (observation, merged) = result.Value;
         return (new JsonObject
         {
-            ["observation"] = ObservationNode(observation, MemoryScopes.Global),
-            ["merged"] = merged,
-            ["outcome"] = merged ? "merged" : "moved",
+            ["observation"] = ObservationNode(result.Observation!, MemoryScopes.Global),
+            ["merged"] = result.Outcome == PromotionOutcomes.Merged,
+            ["outcome"] = result.Outcome,
         }, false);
     }
 
@@ -468,6 +479,17 @@ public sealed class MemoryToolInvoker
             || value.ValueKind is not (JsonValueKind.True or JsonValueKind.False))
         {
             throw new McpInvalidParamsException($"Invalid params: '{name}' is required and must be a boolean.");
+        }
+        return value.GetBoolean();
+    }
+
+    /// <summary>An optional boolean argument; null when absent, so the caller picks the default.</summary>
+    private static bool? OptionalBool(JsonElement args, string name)
+    {
+        if (!args.TryGetProperty(name, out var value) || value.ValueKind == JsonValueKind.Null) return null;
+        if (value.ValueKind is not (JsonValueKind.True or JsonValueKind.False))
+        {
+            throw new McpInvalidParamsException($"Invalid params: '{name}' must be a boolean.");
         }
         return value.GetBoolean();
     }

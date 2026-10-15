@@ -78,6 +78,13 @@ long ProjectIdForWrite(HttpRequest req, string? scope)
     return resolved == MemoryScopes.Global ? store.GetOrCreateGlobalProject().Id : ResolveProject(req).Id;
 }
 
+// Read a boolean request flag: `?name=true` (or `1`). Anything else is false.
+bool Flag(HttpRequest req, string name)
+{
+    var value = req.Query[name].FirstOrDefault();
+    return bool.TryParse(value, out var parsed) ? parsed : value == "1";
+}
+
 // ---- Health ----
 app.MapGet("/health", () => Results.Json(new { status = "ok", db = dbPath }, json));
 
@@ -156,14 +163,28 @@ app.MapDelete("/api/observations/{id:long}", (long id, HttpRequest req) =>
 // Promote a project memory to the global scope: the "I have taught this 100
 // times" path. When a global memory already owns the topic_key, the promoted
 // content wins and the redundant project row is removed; the response says which
-// of the two happened.
+// of the two happened. An archived source is REFUSED by default (409) because it
+// would overwrite live global truth with retired content; pass allowArchived=true
+// to opt in, and the surviving row then keeps the source's state.
 app.MapPost("/api/observations/{id:long}/promote", (long id, HttpRequest req) =>
 {
     var p = ResolveProject(req);
-    var result = store.PromoteObservation(p.Id, id);
+    var allowArchived = Flag(req, "allowArchived");
+    var result = store.PromoteObservation(p.Id, id, allowArchived);
     if (result is null) return Results.NotFound();
-    var (observation, merged) = result.Value;
-    return Results.Json(new { observation, merged, outcome = merged ? "merged" : "moved" }, json);
+    if (result.Outcome == PromotionOutcomes.Refused)
+    {
+        // 409 Conflict: the request conflicts with the source's lifecycle state.
+        return Results.Json(
+            new { outcome = result.Outcome, reason = result.Reason, error = result.Reason },
+            json, statusCode: StatusCodes.Status409Conflict);
+    }
+    return Results.Json(new
+    {
+        observation = result.Observation,
+        merged = result.Outcome == PromotionOutcomes.Merged,
+        outcome = result.Outcome,
+    }, json);
 });
 
 app.MapGet("/api/observations", (HttpRequest req, int limit = 50, string? scope = null, string? state = null) =>
@@ -287,3 +308,9 @@ public sealed class ObservationPinBody
 {
     public bool Pinned { get; set; }
 }
+
+/// <summary>
+/// Exposes the auto-generated entry point type so integration tests can host the
+/// daemon in-process (<c>WebApplicationFactory&lt;Program&gt;</c>).
+/// </summary>
+public partial class Program;

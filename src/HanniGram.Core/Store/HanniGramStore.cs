@@ -546,6 +546,24 @@ public sealed class HanniGramStore : IDisposable
         return r.Read() ? ReadObservation(r) : null;
     }
 
+    /// <summary>
+    /// The most recently updated row for a key in a namespace, INCLUDING archived
+    /// rows. Promotion needs this: a project teaching must recognise an archived
+    /// global row that owns the same key so the teaching REVIVES it (adopting the
+    /// source's state) instead of inserting a second row under the same key. The
+    /// save-upsert deliberately excludes archived rows; promotion deliberately does
+    /// not.
+    /// </summary>
+    private Observation? FindAnyByTopicKey(long projectId, string topicKey, SqliteTransaction? transaction)
+    {
+        using var cmd = CreateCommand(transaction);
+        cmd.CommandText = "SELECT id, project_id, title, content, what, why, where_, learned, topic_key, type, created_at_utc, updated_at_utc, state, pinned FROM observations WHERE project_id = $p AND topic_key = $tk ORDER BY updated_at_utc DESC LIMIT 1";
+        cmd.Parameters.AddWithValue("$p", projectId);
+        cmd.Parameters.AddWithValue("$tk", topicKey);
+        using var r = cmd.ExecuteReader();
+        return r.Read() ? ReadObservation(r) : null;
+    }
+
     public Observation? GetObservation(long projectId, long id)
     {
         lock (_gate)
@@ -639,17 +657,30 @@ public sealed class HanniGramStore : IDisposable
     /// <summary>
     /// Promote a project observation to the global namespace.
     /// <para>
-    /// No collision: the row is MOVED (its project_id is reassigned), keeping its
-    /// id and topic_key. Collision (a global memory already owns the topic_key):
-    /// the promoted content WINS — the existing global row is updated in place and
-    /// the now-redundant project row is deleted, so nothing is duplicated and the
-    /// newer content is not discarded. The FTS sync triggers keep the index
+    /// Lifecycle rule — never destroy live truth with retired content. An
+    /// <c>archived</c> source is retired memory; promoting it by default used to
+    /// overwrite a live global row and leave it <c>active</c>, turning stale
+    /// content into current truth for every project. By default such a promotion is
+    /// therefore REFUSED: nothing is written, no sentinel is created, and the caller
+    /// gets <c>outcome=refused</c> with the reason <c>source_archived</c>.
+    /// <paramref name="allowArchived"/> is the explicit opt-in for a caller that
+    /// really means to promote retired content.
+    /// </para>
+    /// <para>
+    /// No collision: the row is MOVED (its project_id is reassigned), keeping its id,
+    /// topic_key, created_at and lifecycle state, because the row <em>is</em> the
+    /// source. Collision (a global memory already owns the topic_key): the promoted
+    /// content WINS — the existing global row is updated in place and the
+    /// now-redundant project row is deleted, so nothing is duplicated. The surviving
+    /// row adopts the SOURCE's lifecycle state, so a live teaching revives an
+    /// archived global row and an opted-in archived promotion lands <c>archived</c>
+    /// instead of silently becoming active. The FTS sync triggers keep the index
     /// correct through the UPDATE and DELETE; no rebuild.
     /// </para>
-    /// Returns null when the observation is not in the project; the bool is true
-    /// when the promotion merged into an existing global row.
+    /// Returns null when the observation is not in the project; otherwise the
+    /// bounded <see cref="PromotionResult"/> (see <see cref="PromotionOutcomes"/>).
     /// </summary>
-    public (Observation Observation, bool Merged)? PromoteObservation(long projectId, long id)
+    public PromotionResult? PromoteObservation(long projectId, long id, bool allowArchived = false)
     {
         lock (_gate)
         {
@@ -661,21 +692,38 @@ public sealed class HanniGramStore : IDisposable
                 return null;
             }
 
+            // Refuse before resolving the global namespace: a refusal writes nothing
+            // and does not materialise the sentinel.
+            if (!allowArchived && IsArchived(source.State))
+            {
+                tx.Commit();
+                return new PromotionResult
+                {
+                    Outcome = PromotionOutcomes.Refused,
+                    Reason = PromotionOutcomes.ReasonSourceArchived,
+                };
+            }
+
             var global = GetOrCreateProjectCore(MemoryScopes.GlobalProjectName, null, tx);
 
             // A global row with the same topic key (and not the source itself,
             // which is only possible if the caller already passed the global
-            // namespace) triggers the merge path.
+            // namespace) triggers the merge path. Archived global rows are
+            // included so a live teaching REVIVES a forgotten target instead of
+            // inserting a second row under the same key.
             var existing = string.IsNullOrEmpty(source.TopicKey)
                 ? null
-                : FindLatestByTopicKey(global.Id, source.TopicKey, tx);
+                : FindAnyByTopicKey(global.Id, source.TopicKey, tx);
             if (existing is not null && existing.Id != source.Id)
             {
                 using (var update = CreateCommand(tx))
                 {
+                    // state = $s is load-bearing: the surviving row takes the
+                    // source's lifecycle, so retired content can never land as
+                    // active and a live teaching revives an archived target.
                     update.CommandText = @"
                         UPDATE observations
-                        SET title = $t, content = $c, what = $w, why = $y, where_ = $wh, learned = $l, type = $ty, updated_at_utc = $n
+                        SET title = $t, content = $c, what = $w, why = $y, where_ = $wh, learned = $l, type = $ty, state = $s, updated_at_utc = $n
                         WHERE id = $id";
                     update.Parameters.AddWithValue("$t", source.Title);
                     update.Parameters.AddWithValue("$c", source.Content);
@@ -684,6 +732,7 @@ public sealed class HanniGramStore : IDisposable
                     update.Parameters.AddWithValue("$wh", (object?)source.Where ?? DBNull.Value);
                     update.Parameters.AddWithValue("$l", (object?)source.Learned ?? DBNull.Value);
                     update.Parameters.AddWithValue("$ty", (object?)source.Type ?? DBNull.Value);
+                    update.Parameters.AddWithValue("$s", source.State);
                     update.Parameters.AddWithValue("$n", Now());
                     update.Parameters.AddWithValue("$id", existing.Id);
                     update.ExecuteNonQuery();
@@ -696,9 +745,11 @@ public sealed class HanniGramStore : IDisposable
                 var merged = ReadObservationById(global.Id, existing.Id, tx)!;
                 merged.Scope = MemoryScopes.Global;
                 tx.Commit();
-                return (merged, true);
+                return new PromotionResult { Outcome = PromotionOutcomes.Merged, Observation = merged };
             }
 
+            // Move: the row is the source, so its state (and created_at) already
+            // come from the source; only the namespace changes.
             using (var move = CreateCommand(tx))
             {
                 move.CommandText = "UPDATE observations SET project_id = $g, updated_at_utc = $n WHERE id = $id AND project_id = $p";
@@ -712,9 +763,13 @@ public sealed class HanniGramStore : IDisposable
             var moved = ReadObservationById(global.Id, source.Id, tx)!;
             moved.Scope = MemoryScopes.Global;
             tx.Commit();
-            return (moved, false);
+            return new PromotionResult { Outcome = PromotionOutcomes.Moved, Observation = moved };
         }
     }
+
+    /// <summary>Case-insensitive check for the archived lifecycle state.</summary>
+    private static bool IsArchived(string? state) =>
+        string.Equals(state, MemoryStates.Archived, StringComparison.OrdinalIgnoreCase);
 
     public IReadOnlyList<Observation> ListObservations(long projectId, int limit = 50, string? state = null)
         => ListObservations(new[] { new MemoryNamespace(projectId, ScopeOfProject(projectId)) }, limit, state);

@@ -65,6 +65,37 @@ function scope(cwd: string, extra: Record<string, string> = {}): string {
 	return p.toString();
 }
 
+// Model-facing caps, matching the MCP server's budget (src/HanniGram.Mcp/Bounded.cs):
+// no tool may hand the model an unbounded memory body. Truncation is marked with an
+// explicit ellipsis so it is obvious that content was cut.
+const MAX_FIELD_CHARS = 2000;
+const MAX_TITLE_CHARS = 200;
+const MAX_TOKEN_CHARS = 200;
+const TRUNCATION_MARKER = "\u2026";
+
+/** Collapse whitespace and truncate to `max` characters, marking any truncation. */
+function bound(text: unknown, max = MAX_FIELD_CHARS): string {
+	if (typeof text !== "string" || text.length === 0) return "";
+	const collapsed = text.replace(/\s+/g, " ").trim();
+	return collapsed.length <= max ? collapsed : collapsed.slice(0, max) + TRUNCATION_MARKER;
+}
+
+const CONTENT_FIELDS = ["content", "what", "why", "where", "learned"] as const;
+const TOKEN_FIELDS = ["topicKey", "type"] as const;
+
+/**
+ * A copy of a memory row with every free-text field bounded, so the structured
+ * `details` payload is bounded exactly like the rendered text. Non-string fields
+ * (ids, flags) pass through untouched.
+ */
+function boundedObservation<T>(row: T): T {
+	const copy: Record<string, unknown> = { ...(row as Record<string, unknown>) };
+	if (typeof copy.title === "string") copy.title = bound(copy.title, MAX_TITLE_CHARS);
+	for (const field of CONTENT_FIELDS) if (typeof copy[field] === "string") copy[field] = bound(copy[field]);
+	for (const field of TOKEN_FIELDS) if (typeof copy[field] === "string") copy[field] = bound(copy[field], MAX_TOKEN_CHARS);
+	return copy as T;
+}
+
 function healthUrl(): string {
 	return `${baseUrl()}/health`;
 }
@@ -493,30 +524,54 @@ export default function (pi: ExtensionAPI) {
 		name: "mem_promote",
 		label: "HanniGram: promote memory",
 		description:
-			"Promote a project observation to the shared global memory when the lesson turned out to repeat across projects. If the topic key already exists globally, the promoted content overwrites that row.",
+			"Promote a project observation to the shared global memory when the lesson turned out to repeat across projects. If the topic key already exists globally, the promoted content overwrites that row. An archived row is refused unless allowArchived=true (the promoted row then stays archived).",
 		parameters: Type.Object({
 			id: Type.Number({ description: "Observation id in the current project" }),
+			allowArchived: Type.Optional(
+				Type.Boolean({ description: "Promote even when the row is archived. The promoted row stays archived; default false refuses." }),
+			),
 		}),
 		execute: async (_id, params, _signal, _onUpdate, ctx: ExtensionToolContext) => {
 			await ensureDaemon();
-			const res = await apiOrMissing<{
-				observation: { id: number; title: string };
-				merged: boolean;
-				outcome: string;
-			}>(`/api/observations/${params.id}/promote?${scope(ctx.cwd)}`, { method: "POST" });
-			if (!res) {
+			const query = scope(ctx.cwd, params.allowArchived ? { allowArchived: "true" } : {});
+			const res = await fetch(`${baseUrl()}/api/observations/${params.id}/promote?${query}`, { method: "POST" });
+			if (res.status === 404) {
 				ctx.ui.notify(`✗ Memoria #${params.id} no encontrada`, "warning");
 				return { content: [{ type: "text", text: `Observation #${params.id} not found.` }], details: { promoted: false } };
 			}
-			ctx.ui.notify(`✓ Memoria promovida #${res.observation.id} → global (${res.outcome})`, "info");
+			const body = (await res.json().catch(() => ({}))) as {
+				observation?: { id: number; title: string };
+				merged?: boolean;
+				outcome?: string;
+				reason?: string;
+			};
+			if (res.status === 409) {
+				// A refusal is a result the model can act on (retry with allowArchived),
+				// not a thrown error.
+				ctx.ui.notify(`✗ Memoria #${params.id} archivada: promoción rechazada`, "warning");
+				return {
+					content: [
+						{
+							type: "text",
+							text: `Promotion refused (${body.reason ?? "refused"}): observation #${params.id} is archived. Pass allowArchived=true to promote it anyway; the promoted row stays archived.`,
+						},
+					],
+					details: body,
+				};
+			}
+			if (!res.ok) {
+				throw new Error(`HanniGram ${res.status}: ${JSON.stringify(body) || res.statusText}`);
+			}
+			const promoted = body.observation!;
+			ctx.ui.notify(`✓ Memoria promovida #${promoted.id} → global (${body.outcome})`, "info");
 			return {
 				content: [
 					{
 						type: "text",
-						text: `Promoted #${res.observation.id} to global (${res.outcome}): ${res.observation.title}`,
+						text: `Promoted #${promoted.id} to global (${body.outcome}): ${bound(promoted.title, MAX_TITLE_CHARS)}`,
 					},
 				],
-				details: res,
+				details: body,
 			};
 		},
 	});

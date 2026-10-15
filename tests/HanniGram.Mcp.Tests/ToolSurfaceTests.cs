@@ -406,6 +406,32 @@ public sealed class ToolSurfaceTests
     }
 
     [Fact]
+    public void Promote_ArchivedSource_IsRefusedUnlessAllowArchivedIsSet()
+    {
+        using var harness = new McpHarness();
+        // A live global row owns the key; the project row is stale and archived.
+        Wire.Payload(harness.CallTool(1, "mem_save",
+            """{"title":"LIVE-GLOBAL","content":"live global truth","topicKey":"lifecycle/mcp","scope":"global","project":"alpha"}""")!);
+        var saved = Wire.Payload(harness.CallTool(2, "mem_save",
+            """{"title":"RETIRED-PROJECT","content":"retired stale content","topicKey":"lifecycle/mcp","project":"alpha"}""")!);
+        var id = saved["observation"]!.AsObject()["id"]!.GetValue<long>();
+        harness.CallTool(3, "mem_state", $$"""{"id":{{id}},"state":"archived","project":"alpha"}""");
+
+        var refused = harness.CallTool(4, "mem_promote", $$"""{"id":{{id}},"project":"alpha"}""")!;
+        Assert.True(Wire.IsError(refused));
+        var refusedPayload = Wire.Payload(refused);
+        Assert.Equal("refused", refusedPayload["outcome"]!.GetValue<string>());
+        Assert.Equal("source_archived", refusedPayload["reason"]!.GetValue<string>());
+
+        // The live global row is untouched, and the opt-in lands the content archived.
+        var optIn = Wire.Payload(harness.CallTool(5, "mem_promote",
+            $$"""{"id":{{id}},"allowArchived":true,"project":"alpha"}""")!);
+        Assert.Equal("merged", optIn["outcome"]!.GetValue<string>());
+        Assert.Equal("archived", optIn["observation"]!.AsObject()["state"]!.GetValue<string>());
+        Assert.Equal("RETIRED-PROJECT", optIn["observation"]!.AsObject()["title"]!.GetValue<string>());
+    }
+
+    [Fact]
     public void Review_ReturnsFlaggedRowsWithTruncatedPreviews()
     {
         using var harness = new McpHarness();

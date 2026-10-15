@@ -270,12 +270,13 @@ public static class MemoryToolCatalog
         new McpToolDefinition(
             "mem_promote",
             "HanniGram: promote memory",
-            "Promote a project observation into the shared global scope. When the topic key already exists globally, the promoted content wins and the global row is updated in place.",
+            "Promote a project observation into the shared global scope. Refused if the row is archived unless allowArchived is set; the global row then takes the source's state.",
             """
             {
               "type": "object",
               "properties": {
                 "id": { "type": "integer", "description": "Observation id in the project namespace." },
+                "allowArchived": { "type": "boolean", "description": "Promote even when the row is archived. The promoted row stays archived; default false refuses." },
                 %PROJECT%
               },
               "required": ["id"],

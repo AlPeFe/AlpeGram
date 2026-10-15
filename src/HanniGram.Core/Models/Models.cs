@@ -93,6 +93,22 @@ public sealed class SearchHit
 public readonly record struct MemoryNamespace(long ProjectId, string Scope);
 
 /// <summary>
+/// The result of a promotion. <see cref="Outcome"/> is one of the bounded
+/// <see cref="PromotionOutcomes"/> tokens (<c>moved</c>, <c>merged</c>,
+/// <c>refused</c>). <see cref="Observation"/> is present for <c>moved</c> and
+/// <c>merged</c> and absent for <c>refused</c>; <see cref="Reason"/> is set only
+/// for <c>refused</c>. A not-found source is reported as a null result, not as a
+/// refusal.
+/// </summary>
+public sealed class PromotionResult
+{
+    public required string Outcome { get; init; }
+    public Observation? Observation { get; init; }
+    /// <summary>Machine-readable refusal reason (e.g. <c>source_archived</c>), or null.</summary>
+    public string? Reason { get; init; }
+}
+
+/// <summary>
 /// The compact review hint a save returns when it detected a collision. A few
 /// tokens only: the colliding id, its truncated title and the kind of collision.
 /// It is absent (null) when there is nothing to report. This is the entire

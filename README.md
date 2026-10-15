@@ -21,7 +21,7 @@ SQLite + FTS5 (~/.hannigram/hannigram.db)
 ## Qué hace
 
 - **Memoria por proyecto** — resuelve el proyecto desde el directorio de trabajo (git remote cuando está disponible), así cada proyecto tiene su propio espacio de memoria.
-- **Dos ámbitos: `project` y `global`** — `project` es el espacio del repositorio; `global` es una memoria compartida por **todos** los proyectos, para lo que no es un hecho del repo sino una heurística que se repite: cómo montas una consola, tus convenciones de commit, en qué capas separas el código. Se elige al escribir (`scope=project|global`) y `hannigram promote <id>` sube al ámbito global un hallazgo que resultó genérico; si el `topic_key` ya existe allí, el nuevo contenido gana **sobre la fila global, en el sitio** (sin duplicados). Los dos ámbitos comparten un único store, un único índice FTS y el mismo upsert por `topic_key`.
+- **Dos ámbitos: `project` y `global`** — `project` es el espacio del repositorio; `global` es una memoria compartida por **todos** los proyectos, para lo que no es un hecho del repo sino una heurística que se repite: cómo montas una consola, tus convenciones de commit, en qué capas separas el código. Se elige al escribir (`scope=project|global`) y `hannigram promote <id>` sube al ámbito global un hallazgo que resultó genérico; si el `topic_key` ya existe allí, el nuevo contenido gana **sobre la fila global, en el sitio** (sin duplicados). Una fila `archived` se **rechaza** por defecto (HTTP 409, `outcome=refused`, `reason=source_archived`) para no pisar la verdad global viva con contenido retirado; con `allowArchived=true` se promueve igual, pero la fila resultante conserva el estado `archived`. Los dos ámbitos comparten un único store, un único índice FTS y el mismo upsert por `topic_key`.
 - **Observaciones estructuradas** — What / Why / Where / Learned, con título y tipo buscables.
 - **Búsqueda de texto completo** — SQLite FTS5 sobre las observaciones, con **tokenizer trigram**: tolera typos (buscar `rozado` encuentra `rosado`), substrings y CJK. Si el match estricto no da resultados, reintenta con los trigramas de la query (fuzzy) rankeado por bm25.
 - **Búsqueda entre ámbitos** — `hannigram search` y `/api/search` aceptan `scope=project|global|all` (por defecto `all`): devuelven los aciertos del proyecto **y** los globales en un solo resultado, cada uno etiquetado con su origen, para que el modelo distinga un hecho del repo de una heurística universal.
@@ -66,7 +66,7 @@ dotnet run -c Release
 | DELETE | `/api/observations/{id}?cwd=` | Borrar una observación (escopada al proyecto) |
 | POST | `/api/observations/{id}/state?cwd=&scope=` | Cambiar el estado (`active`/`needs_review`/`archived`) |
 | POST | `/api/observations/{id}/pin?cwd=&scope=` | Fijar o quitar el pin de una observación |
-| POST | `/api/observations/{id}/promote?cwd=` | Promover una observación al ámbito global |
+| POST | `/api/observations/{id}/promote?cwd=&allowArchived=` | Promover una observación al ámbito global; una fuente `archived` se rechaza con 409 salvo `allowArchived=true` |
 | GET | `/api/search?cwd=&q=&limit=&type=&topicKey=&scope=&state=` | Búsqueda FTS5 (filtro opcional por `type`, `topicKey`, `scope` y `state`) |
 | GET | `/api/review?cwd=&scope=&limit=` | Revisión acotada: filas `needs_review` + candidatos duplicados, con previews truncados |
 | GET | `/api/context?cwd=` | Contexto de inyección acotado: heurísticas globales fijadas + filas recientes |
@@ -122,7 +122,7 @@ El directorio `pi-extension/` es una extensión de Pi que registra las tools `me
 
 Tools: `mem_current_project`, `mem_save`, `mem_search`, `mem_context`, `mem_timeline`, `mem_get_observation`, `mem_suggest_topic_key`, `mem_session_summary`, `mem_update`, `mem_review`, `mem_promote`, `mem_state`, `mem_pin`.
 
-`mem_save` acepta `scope=project|global` y `mem_search` acepta `scope=project|global|all` (cada acierto llega etiquetado con su origen); `mem_update`, `mem_state` y `mem_pin` aceptan `scope` para elegir a qué ámbito pertenece la fila. `mem_delete` borra en el ámbito del proyecto actual.
+`mem_save` acepta `scope=project|global` y `mem_search` acepta `scope=project|global|all` (cada acierto llega etiquetado con su origen); `mem_update`, `mem_state`, `mem_pin` y `mem_delete` aceptan `scope` para elegir a qué ámbito pertenece la fila (así `mem_delete` alcanza la memoria global). `mem_promote` acepta `allowArchived`: una fuente `archived` se rechaza por defecto y el rechazo llega como resultado (`outcome=refused`, `reason=source_archived`), no como error.
 
 Todas las tools son **bajo demanda**: la extensión no inyecta memoria en el prompt por sí sola ni inyecta texto completo de una observación.
 
