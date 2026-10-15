@@ -80,6 +80,7 @@ public sealed class HanniGramStore : IDisposable
             );
             CREATE INDEX IF NOT EXISTS idx_obs_project ON observations(project_id);
             CREATE INDEX IF NOT EXISTS idx_obs_topic ON observations(project_id, topic_key);
+            CREATE INDEX IF NOT EXISTS idx_obs_project_updated ON observations(project_id, updated_at_utc DESC);
             CREATE INDEX IF NOT EXISTS idx_sess_project ON sessions(project_id);
         ");
 
@@ -236,8 +237,11 @@ public sealed class HanniGramStore : IDisposable
 
     private Observation? FindLatestByTopicKey(long projectId, string topicKey)
     {
+        // Order by updated_at_utc, not created_at_utc: an upsert preserves the
+        // original created_at, so created_at ordering would keep returning the
+        // stalest duplicate of a topic key.
         using var cmd = _conn.CreateCommand();
-        cmd.CommandText = "SELECT id, project_id, title, content, what, why, where_, learned, topic_key, type, created_at_utc, updated_at_utc FROM observations WHERE project_id = $p AND topic_key = $tk ORDER BY created_at_utc DESC LIMIT 1";
+        cmd.CommandText = "SELECT id, project_id, title, content, what, why, where_, learned, topic_key, type, created_at_utc, updated_at_utc FROM observations WHERE project_id = $p AND topic_key = $tk ORDER BY updated_at_utc DESC LIMIT 1";
         cmd.Parameters.AddWithValue("$p", projectId);
         cmd.Parameters.AddWithValue("$tk", topicKey);
         using var r = cmd.ExecuteReader();
@@ -282,7 +286,10 @@ public sealed class HanniGramStore : IDisposable
         {
             var list = new List<Observation>();
             using var cmd = _conn.CreateCommand();
-            cmd.CommandText = "SELECT id, project_id, title, content, what, why, where_, learned, topic_key, type, created_at_utc, updated_at_utc FROM observations WHERE project_id = $p ORDER BY created_at_utc DESC LIMIT $l";
+            // updated_at_utc is the real recency signal: a topic-key upsert keeps
+            // created_at_utc, so ordering by created_at would bury a memory that
+            // just evolved at its original position.
+            cmd.CommandText = "SELECT id, project_id, title, content, what, why, where_, learned, topic_key, type, created_at_utc, updated_at_utc FROM observations WHERE project_id = $p ORDER BY updated_at_utc DESC LIMIT $l";
             cmd.Parameters.AddWithValue("$p", projectId);
             cmd.Parameters.AddWithValue("$l", limit);
             using var r = cmd.ExecuteReader();
