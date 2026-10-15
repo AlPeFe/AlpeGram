@@ -810,3 +810,114 @@ rows as `title (topic_key): learned`).
   `core.autocrlf=true`, so the worktree file is checked out as CRLF while the index stores LF; the
   CLI writes LF and nothing else changed.
 
+### Verifier findings F1-F4 — fixed and verified (2026-10-15)
+
+An independent verifier ran against the slice 5 tree and reported four defects. Each is fixed as its
+own work-unit commit, green on its own, with the pre-fix failure reproduced first.
+
+| Finding | Commit | Summary |
+|---|---|---|
+| F1 | `989c2cd` | `fix(promote): refuse archived sources and preserve lifecycle state` |
+| F2 | `9e2a341` | `fix(api): expose the canonical topic-key query route` |
+| F3 | `b862450` | `fix(extension): bound the model-facing memory reads` |
+| F4 | `cc546c4` | `fix(delete): let mem_delete reach the global scope` |
+
+What each finding was, in one line:
+
+- **F1 — promotion ignored the lifecycle.** `PromoteObservation` moved or merged an `archived`
+  source and left the surviving global row `active`, so retired content became current truth for
+  every project. It now returns a bounded `PromotionResult` (`moved` / `merged` / `refused` plus the
+  reason `source_archived`): an archived source is refused by default (no write, no sentinel), the
+  route answers `409`, the MCP tool returns an `isError` result, and `allowArchived=true` is the
+  opt-in that lands the content `archived`. An `archived` global target is now found through
+  `FindAnyByTopicKey`, so a live teaching revives it instead of inserting a second row.
+- **F2 — slash topic keys were unretrievable over HTTP.** The only by-key route took the key as a
+  path segment, so `encodeURIComponent("svc/auth")` never matched and callers got a silent `[]`. The
+  canonical form is now `GET /api/observations/topic?topicKey=…`, with the path form kept for plain
+  keys and as a catch-all route for raw slash paths, and a still-encoded key decoded before lookup.
+- **F3 — model-facing reads were unbounded.** `mem_get_observation` returned the raw JSON of a row,
+  so a 6000-character body reached the model intact. Every read tool now renders through the same
+  budget as the MCP caps (2000 characters for free text, 200 for titles and tokens, an explicit
+  ellipsis, and bounded `details` payloads), and `GetByTopicKey` carries its own hard cap of 50 rows
+  because it is the only read that returns a key's whole history.
+- **F4 — `mem_delete` could not reach global memory.** The extension's delete only ever addressed the
+  caller's project; it now takes `scope`, and the server's DELETE route resolves `scope=global`
+  read-only so a miss reports `404` instead of materialising the sentinel.
+
+Observed evidence (`dotnet --version` = `10.0.401`, `node --version` = `v24.14.0`):
+
+- Per-commit `dotnet build src/HanniGram.Server -c Release` → **0 errors**; per-commit test runs
+  (Core / MCP): F1 → **127 / 59**, F2 → **127 / 59**, F3 → **130 / 59**, F4 → **130 / 59**, every one
+  `Con error: 0`. The final tree is **189 passed, 0 failed** (130 Core + 59 MCP), up from 180.
+- Pre-fix proof for every new regression test. The fix is reverted in place while its API is kept, so
+  the tests compile and fail on **behaviour** rather than on a build error, and the tree is restored
+  afterwards:
+  - F1 (Store: the refusal guard, the archived-target lookup and the `state = $s` propagation
+    dropped) → **4 failures, 126 passed** in Core:
+    `Promote_ArchivedSource_IsRefusedAndLeavesTheLiveGlobalRowUntouched` (PromotionTests.cs:158),
+    `Promote_ArchivedSource_RefusedByDefault_WritesNothingAndCreatesNoSentinel` (184),
+    `Promote_ArchivedSource_WithOptIn_LandsArchived_AndNeverActive` (211),
+    `Promote_ActiveSource_OverArchivedGlobalTarget_RevivesItToTheSourceState` (251). MCP →
+    **1 failure, 58 passed**:
+    `ToolSurfaceTests.Promote_ArchivedSource_IsRefusedUnlessAllowArchivedIsSet` (`Assert.True()`
+    failure on the `isError` result).
+  - F3 C# (the clamp and the SQL `LIMIT` wiring dropped) → **2 failures, 128 passed**:
+    `TimelineBoundTests.GetByTopicKey_IsCapped_AtTheStoreLimit` (TimelineBoundTests.cs:25) and
+    `GetByTopicKey_ClampsACallerLimit_SoItCannotBeRaised` (37), both `Assert.Equal() Failure: Values
+    differ`.
+  - F2 (the query route, the catch-all route and `mem_timeline`'s query form dropped) → the
+    extension verifier stops at `verify-extension.mjs:185` with
+    `mem_timeline returned nothing for the slash topic key 'svc/auth' (silent false negative)`, after
+    the server answered `No observations for topic 'svc/auth'.`
+  - F3 extension (every bounding call dropped) → the verifier stops at `verify-extension.mjs:217`
+    with `mem_get_observation returned 6302 characters; the model-facing body must be bounded`.
+  - F4 (the DELETE scope and `mem_delete`'s scope dropped) → the verifier stops at
+    `verify-extension.mjs:240` with `mem_delete with scope='global' did not delete the global
+    memory`, after the delete answered `Observation #7 not found.`
+- `node --experimental-strip-types verify-extension.mjs` against a daemon **built from source** on a
+  **fresh temp db and a non-default port**, run at the F2 commit (8795), the F3 commit (8796) and the
+  F4 commit (8797) → **exit 0** in all three, each printing `Tool list matches the expected 14 tools`
+  and `ALL TOOLS EXECUTED OK`. The three revert proofs above ran the same harness on ports
+  8801 / 8803 / 8804.
+- Raw-HTTP end-to-end at the final commit (port 8799, fresh temp db, the same source binary) →
+  **31/31 checks passed**, covering all four findings:
+  - the refusal: `409` with `outcome=refused` and `reason=source_archived`, the live global row
+    unchanged (same title and state, still visible), the archived source still present, and no
+    duplicate global row left behind;
+  - the opt-in: `200`, `outcome=merged`, the surviving row `state=archived` carrying the source's
+    content, and hidden from the default global listing;
+  - all four topic-key forms (query raw, query percent-encoded, raw-slash path, `%2F` path) plus the
+    plain-key path form and the missing-`topicKey` `400`;
+  - the by-key cap: 55 rows seeded through SQLite (the write path upserts by `topic_key`, so a key
+    cannot accumulate rows over HTTP) → the route returns 50, still 50 when the caller adds
+    `limit=1000`, and 1 when the caller asks for `limit=1`;
+  - the global delete: `scope=global` deletes the global row, reports `404` for a project row (which
+    survives) and for a missing id, and the unscoped project delete still works.
+- Hygiene: the live daemon on `127.0.0.1:8765` (pid 5880) and the user's real db were never touched —
+  the db mtime is unchanged at `2026-10-15T07:30:30.5035170Z`. Every temporary daemon was stopped and
+  every temp db removed; the only running `HanniGram.Server` process is pid 5880. Nothing was pushed:
+  the four commits sit on `feat/memory-v2` locally.
+
+#### What changed the plan (F1-F4)
+
+- **The first draft of the F1 commit was rebuilt.** Its `pi-extension/index.ts` emitted the
+  `allowArchived` parameter block inside `mem_promote`'s *return* object instead of its
+  `parameters: Type.Object({…})` schema. The file still parsed — `allowArchived:` was just a stray
+  property on a returned object — but the harness validates arguments against `parameters`, so the
+  documented opt-in was not reachable from the model, and the returned payload carried a field no
+  caller asked for. That is the same class of defect as F1 itself and it is invisible to
+  `dotnet test`, which does not cover the extension. The four commits were therefore rebuilt from the
+  verified final tree through an explicit hunk→finding map, and the branch now carries
+  `989c2cd` / `9e2a341` / `b862450` / `cc546c4` instead of the earlier drafts.
+- **Which finding owns a hunk is a judgement, not a fact.** `Program.cs`'s `Flag()` helper and
+  `public partial class Program;` are F1 (the refusal needs the first; the second is the integration
+  hosting hook), the topic routes are F2, and the DELETE scope is F4. The README sentence that
+  carries both the `mem_delete` scope and the `mem_promote` opt-in is attributed to F1, because
+  splitting one 1-line hunk would have meant inventing a hunk. Every stage was materialised, built,
+  tested and committed on its own, so the split is proven rather than asserted.
+- **Two facts invalidated the first version of the end-to-end script.** `GET /api/observations/{id}`
+  is project-scoped only (it ignores `?scope=global`), and the write path upserts by `topic_key`.
+  The final script therefore reads global rows from the global listing rather than by id, and seeds
+  the cap rows directly in SQLite exactly as `TimelineBoundTests` does. One revert run was also
+  discarded because the Release binary had not been rebuilt after the source was restored; the
+  proofs above come from runs against a freshly built binary.
