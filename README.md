@@ -27,6 +27,7 @@ SQLite + FTS5 (~/.hannigram/hannigram.db)
 - **Memoria local exportada** — `hannigram init` crea el proyecto en la BD **y** escribe `.hannigram/memory.md` en el proyecto: una vista markdown de las decisiones, para que cualquier harness (o persona) que solo trabaje con ficheros lea la memoria sin depender del daemon. La BD sigue siendo la fuente de verdad.
 - **Topic keys** — claves estables (`architecture/auth-model`) para mantener el conocimiento evolutivo en un solo lugar. Guardar con un `topic_key` ya existente **actualiza** la observación (upsert) en vez de crear una versión duplicada.
 - **Sesiones + handoff** — `session_summary` guarda objetivo, descubrimientos y próximos pasos para que la siguiente sesión recupere el contexto.
+- **Ciclo de vida y revisión** — cada observación tiene un estado (`active` / `needs_review` / `archived`) y un flag `pinned`. Las lecturas devuelven solo `active` por defecto; `archived` es el olvido seguro (la fila se conserva) y queda excluida salvo que se pida con `state=`. Guardar devuelve un aviso `review` compacto cuando sobrescribe un `topic_key` o detecta un casi-duplicado; `GET /api/review` los lista acotados con previews truncados. La inyección automática (`GET /api/context`) se limita a un número fijo de heurísticas globales fijadas (`pinned`) más unas pocas filas recientes del proyecto.
 
 ## Arquitectura
 
@@ -53,27 +54,37 @@ dotnet run -c Release
 | GET | `/health` | Health + ruta de la BD |
 | GET | `/api/projects` | Listar proyectos |
 | GET | `/api/projects/current?cwd=` | Resolver proyecto para un cwd |
-| POST | `/api/observations?cwd=` | Guardar una observación (upsert por `topic_key`) |
+| POST | `/api/observations?cwd=&scope=` | Guardar una observación (upsert por `topic_key`); devuelve un `review` compacto si hubo colisión |
 | GET | `/api/observations/{id}?cwd=` | Obtener una observación (escopada al proyecto) |
-| GET | `/api/observations?cwd=&limit=` | Observaciones recientes |
-| GET | `/api/observations/topic/{key}?cwd=` | Observaciones por topic key |
+| GET | `/api/observations?cwd=&limit=&scope=&state=` | Observaciones recientes (solo `active` por defecto) |
+| GET | `/api/observations/topic/{key}?cwd=` | Observaciones por topic key (historial completo) |
+| PUT | `/api/observations/{id}?cwd=&scope=` | Actualizar una observación por id (mem_update); los campos nulos no cambian |
 | DELETE | `/api/observations/{id}?cwd=` | Borrar una observación (escopada al proyecto) |
-| GET | `/api/search?cwd=&q=&limit=&type=&topicKey=` | Búsqueda FTS5 (filtro opcional por `type` y `topicKey`) |
+| POST | `/api/observations/{id}/state?cwd=&scope=` | Cambiar el estado (`active`/`needs_review`/`archived`) |
+| POST | `/api/observations/{id}/pin?cwd=&scope=` | Fijar o quitar el pin de una observación |
+| POST | `/api/observations/{id}/promote?cwd=` | Promover una observación al ámbito global |
+| GET | `/api/search?cwd=&q=&limit=&type=&topicKey=&scope=&state=` | Búsqueda FTS5 (filtro opcional por `type`, `topicKey`, `scope` y `state`) |
+| GET | `/api/review?cwd=&scope=&limit=` | Revisión acotada: filas `needs_review` + candidatos duplicados, con previews truncados |
+| GET | `/api/context?cwd=` | Contexto de inyección acotado: heurísticas globales fijadas + filas recientes |
 | GET | `/api/topics?cwd=` | Topic keys existentes |
 | POST | `/api/sessions/start?cwd=` | Iniciar una sesión |
 | POST | `/api/sessions/end?cwd=` | Terminar una sesión (summary) |
 | GET | `/api/sessions?cwd=` | Listar sesiones |
 
-Ámbito de proyecto: pasa `cwd` (o `project`) como query param; el daemon resuelve el proyecto desde ahí.
+Ámbito de proyecto: pasa `cwd` (o `project`) como query param; el daemon resuelve el proyecto desde ahí. `scope=global` escribe/lee la memoria compartida entre proyectos; `state=` selecciona el ciclo de vida (`active` por defecto, o `needs_review`/`archived`/`all`).
 
 ## CLI (standalone)
 
 ```bash
 hannigram project [cwd]
 hannigram init [--cwd]   # crea el proyecto en la BD + escribe .hannigram/memory.md (memoria local exportada)
-hannigram save <title> [--content] [--what] [--why] [--where] [--learned] [--topic] [--type] [--project] [--cwd]
-hannigram search <query> [--limit] [--project] [--cwd]
-hannigram list [--limit] [--project] [--cwd]
+hannigram save <title> [--content] [--what] [--why] [--where] [--learned] [--topic] [--type] [--scope project|global] [--project] [--cwd]
+hannigram update <id> [--title] [--content] [--what] [--why] [--where] [--learned] [--topic] [--type] [--scope project|global] [--project] [--cwd]
+hannigram state <id> --set active|needs_review|archived [--scope project|global] [--project] [--cwd]
+hannigram pin <id> [--off] [--scope project|global] [--project] [--cwd]
+hannigram search <query> [--limit] [--state active|needs_review|archived|all] [--scope project|global|all] [--project] [--cwd]
+hannigram list [--limit] [--state active|needs_review|archived|all] [--project] [--cwd]
+hannigram review [--limit] [--scope project|global|all] [--project] [--cwd]
 hannigram topics [--project] [--cwd]
 hannigram session-start [--id] [--project] [--cwd]
 hannigram session-end <id> [--summary] [--goal] [--next] [--project] [--cwd]

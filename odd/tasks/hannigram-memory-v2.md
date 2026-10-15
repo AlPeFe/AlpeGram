@@ -121,10 +121,10 @@ extension stays the primary zero-config path.
 
 **Task additions**
 
-- [ ] **T20** Implement `mem_update` (update an observation by id, preserving `created_at_utc`
+- [x] **T20** Implement `mem_update` (update an observation by id, preserving `created_at_utc`
       and re-scoping through the same `topic_key` rules) and expose it in the extension, so the
       reference in the sODD skill stops being a broken contract.
-- [ ] **T21** Global injection budget: at most a small fixed number of pinned global heuristics
+- [x] **T21** Global injection budget: at most a small fixed number of pinned global heuristics
       enter the automatic context path; everything else global is retrieved on demand.
 - [ ] **T22** Fix the doc/code discrepancy about when memory is auto-injected.
 
@@ -176,12 +176,12 @@ extension stays the primary zero-config path.
 
 ### Slice 3 — review loop (no token overhead)
 
-- [ ] **T13** Lifecycle: `state` column (`active|needs_review|archived`) plus `pinned`.
+- [x] **T13** Lifecycle: `state` column (`active|needs_review|archived`) plus `pinned`.
       Search and context filter to `active` by default; archived is excluded unless asked.
-- [ ] **T14** Cheap deterministic review signal on save: when a save with a `topic_key`
+- [x] **T14** Cheap deterministic review signal on save: when a save with a `topic_key`
       updates an existing row, or when an unkeyed save has a high-similarity title in the same
       scope, return a compact `review` hint in the save response (a few tokens, no dump).
-- [ ] **T15** `mem_review` tool: bounded listing of `needs_review` / duplicate candidates with
+- [x] **T15** `mem_review` tool: bounded listing of `needs_review` / duplicate candidates with
       truncated previews; plus `mem_delete` (already present) and archive as the safe default.
 
 ### Slice 4 — MCP and portability
@@ -464,4 +464,113 @@ CLI / API surface (the MCP wrapper is Slice 4):
   `ObjectDisposedException`. `[assembly: CollectionBehavior(DisableTestParallelization = true)]`
   fixes it (12/12 stable runs). This is infrastructure, not scope behaviour, so it is its own commit
   (`c6e923f`) ahead of T10.
+
+### Slice 3 — review loop implemented and verified (2026-10-15)
+
+Work-unit commits on `feat/memory-v2` (tests ship inside the commit that changes the behaviour they
+verify, so every commit is green on its own):
+
+| Task | Commit | Summary |
+|---|---|---|
+| T13 | `f891e9a` | `feat(core): add an observation lifecycle state and pinned ordering` |
+| T14 | `a453cae` | `feat(core): report a compact near-duplicate hint on save` |
+| T15 | `0c4dc0a` | `feat(core): add a bounded review surface and lifecycle endpoints` |
+| T20 | `1e9a752` | `feat(core): implement mem_update to edit an observation by id` |
+| T21 | `a04fe07` | `feat(core): expose a bounded global injection surface for context` |
+
+`SchemaVersion` moves **3 → 4**. `observations` gains `state TEXT NOT NULL DEFAULT 'active'` and
+`pinned INTEGER NOT NULL DEFAULT 0`. The FTS column set is unchanged, so the version bump still runs
+the standard one-off re-index; a new idempotent `EnsureObservationLifecycleColumns()` (gated by
+`PRAGMA table_info`) re-asserts the two columns on **both** the migrating and the already-migrated
+path, and the new `idx_obs_project_state_updated` index is created only after the columns exist.
+
+Observed evidence (`dotnet --version` = `10.0.401`; restore from the local NuGet cache; the only
+restore noise is `NU1900` for the unreachable private feed `treball.original-soft.com`):
+
+- `dotnet build HanniGram.slnx -c Release --nologo` → 0 errors (9 warnings: 8 `NU1900`, plus the
+  pre-existing `CS8604` in `Program.cs`).
+- `dotnet test HanniGram.slnx -c Release --nologo` → **122 passed, 0 failed** (87 before this
+  slice; +10 T13, +7 T14, +5 T15, +7 T20, +6 T21).
+- Each behaviour was temporarily reverted and its tests re-run before restoring, to prove the tests
+  detect the gap:
+  - **T13** (lifecycle columns + `active`-by-default filter reverted): 5 `LifecycleTests` failed
+    (archived rows leaked into the default search/list; the `state=` selector returned nothing).
+  - **T14** (save hint disabled): 3 `SaveReviewHintTests` failed (no `review` on a keyed upsert and
+    on an unkeyed near-duplicate).
+  - **T15** (review surface removed): 4 `ReviewSurfaceTests` failed.
+  - **T20** (`UpdateObservation` / `PUT` reverted): 5 `UpdateObservationTests` failed.
+  - **T21** (context surface removed): 4 `ContextSurfaceTests` failed.
+- End-to-end against a **daemon built from source**, `HANNIGRAM_DB` = temp file,
+  `HANNIGRAM_URLS=http://127.0.0.1:8796`; server stopped and the temp dir removed afterwards. The
+  real db (`~/.hannigram/hannigram.db`) and the live daemon on 8765 were never touched:
+  - Keyed upsert returns a compact, truncated `review` hint (kind `topic_key`); an unkeyed save
+    whose title is a near-duplicate of an existing row returns a hint (kind `duplicate`).
+  - An archived row is excluded from the default search and list, and returned again with
+    `state=archived` and `state=all`. An unknown `state=` value → **HTTP 400**.
+  - `PUT /api/observations/{id}` preserves `created_at_utc`, moves `updated_at_utc`, treats an
+    empty string as "clear", and returns **404** for another project's id (scoped by project).
+  - Pin + `GET /api/context` enforce the caps at **3** pinned global heuristics and **6** recent
+    project rows, each row a truncated preview (never a body).
+  - `GET /api/review` is bounded to **≤ 50** items, each preview **≤ 201** characters.
+
+CLI / API surface (the MCP wrapper is Slice 4):
+
+- `GET /api/observations` and `GET /api/search` accept `state=active|needs_review|archived|all`
+  (default `active`); `GET /api/review` is the bounded review listing.
+- `POST /api/observations/{id}/state?cwd=&scope=` sets `{ "state": ... }`;
+  `POST /api/observations/{id}/pin?cwd=&scope=` sets `{ "pinned": true|false }`.
+- `PUT /api/observations/{id}?cwd=&scope=` updates an observation (nullable fields: null = leave
+  unchanged, empty string = clear) — this is `mem_update`.
+- `GET /api/context?cwd=` is the bounded automatic-injection surface (no `limit` parameter).
+- CLI: `hannigram update|state|pin|review`, plus `--state` on `search`/`list`.
+
+The **T21 contract** (the hard budget on automatic injection):
+
+- Endpoint: `GET /api/context?cwd=` (project resolved from the daemon like every other read; no
+  `scope` and **no `limit` parameter by design** — a caller can never widen the budget).
+- Caps (public constants on `HanniGramStore`, the single place to change the budget):
+  `MaxPinnedGlobalHeuristics = 3`, `MaxRecentProjectRows = 6`. The review cap is
+  `MaxReviewItems = 50`.
+- Pinned-global half — SQL equivalent:
+  `SELECT id, title, content, topic_key, type, pinned FROM observations WHERE project_id = _global AND pinned = 1 AND state <> 'archived' ORDER BY updated_at_utc DESC, id DESC LIMIT 3`.
+- Recent-project half — SQL equivalent:
+  `SELECT id, title, content, topic_key, type, pinned FROM observations WHERE project_id = <project> AND state = 'active' ORDER BY pinned DESC, updated_at_utc DESC, id DESC LIMIT 6`.
+- Both halves return previews only: title ≤ 80 chars, context preview ≤ 160 chars. The observation
+  body never leaves the store on this surface.
+
+### What changed the plan (Slice 3)
+
+- **T13 ships the store + model only; T15 owns every lifecycle endpoint.** The `state`/`pin` HTTP
+  routes, the `state=` query params, and the CLI `state`/`pin`/`review` commands are attributed to
+  T15 (the "review loop" task), leaving T13 as a pure schema/model/ordering commit. This keeps the
+  T13 diff about persistence and T15 about the surface.
+- **Default read state is `active` only; archived is the safe forget.** `state=` accepts
+  `active|needs_review|archived|all`, and archived is excluded unless explicitly asked. `archive`
+  is therefore the non-destructive default over `delete`. `GetByTopicKey` stays unfiltered so the
+  full history of a key is still reachable.
+- **Upsert targets the latest non-archived row for a `topic_key`.** Saving a key whose only row is
+  archived inserts a new active row instead of reviving the archived one; this matches "latest
+  teaching wins" without silently un-archiving.
+- **`SetObservationState` / `SetObservationPinned` do not move `updated_at_utc`.** A lifecycle
+  change is metadata, not a re-teach, so it must not reorder recency. Recency ordering itself gained
+  `pinned DESC` in `ListObservations` and in the context ordering; `Search` stays ordered by bm25.
+- **`SaveObservation` keeps its 2-tuple and delegates.** The review hint is additive:
+  `SaveObservationWithReview` returns `(Observation, bool Created, SaveReviewHint? Review)` and the
+  old signature forwards to it, so no existing caller changes. Hint kinds are `topic_key` (a keyed
+  save overwrote an existing row) and `duplicate` (an unkeyed save is a near-duplicate in the same
+  scope).
+- **Similarity is deterministic and bounded.** `MemoryDedup` normalizes to alphanumeric tokens
+  (len ≥ 2) over title + content and computes Dice `2|A∩B| / (|A|+|B|)`; a row is a near-duplicate
+  when both `MinSignatureTokens` (3) and Dice ≥ `NearDuplicateThreshold` (0.8); the scan is bounded
+  by `WindowSize` (50). No LLM, no embeddings.
+- **T20 `UpdateObservation` uses nullable overrides** (null = unchanged, empty string = clear),
+  preserves `created_at_utc`, moves `updated_at_utc`, and is scoped by project. A `topic_key`
+  collision makes the updated row win and leaves the other row unkeyed — non-destructive, no
+  duplicate and no dropped data.
+- **The sODD skill's `mem_update` reference stops being a broken contract.** `sodd/SKILL.md`
+  referenced `mem_update`, which HanniGram never implemented. T20 adds it (store + `PUT` + CLI);
+  HanniPI and `pi-extension/index.ts` are untouched here (Slice 5 wires the extension).
+- **The whole slice was reconstructed task-by-task forward from HEAD to guarantee every commit is
+  green.** After the split the final tree was diffed byte-for-byte against the pre-split working
+  tree to confirm identity.
 
