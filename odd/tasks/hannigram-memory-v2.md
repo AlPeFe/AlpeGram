@@ -74,6 +74,13 @@ Both scopes share one store, one FTS index, one upsert-by-`topic_key` mechanism.
 written to a scope explicitly; it can be promoted from `project` to `global` when it proves
 generic. Cross-scope search returns project hits **and** global hits with their origin marked.
 
+Implementation notes (verified in Slice 2): the global namespace is the reserved sentinel project
+`_global`, stored in the same `projects` table — no second store. Reads resolve it read-only and
+never create it; only a write to `scope=global` materializes the row. `ProjectResolver.Resolve`
+never returns the sentinel, so a directory named `_global` stays an ordinary project. Promoting a
+memory whose `topic_key` already exists in the global scope overwrites the global row in place
+(latest teaching wins) instead of accumulating duplicates.
+
 ## HanniPI integration constraints (verified 2026-10-15)
 
 The harness side was mapped before designing the global scope and MCP. These are facts, not
@@ -158,13 +165,13 @@ extension stays the primary zero-config path.
 
 ### Slice 2 — scopes
 
-- [ ] **T10** Global scope: reserve the `_global` sentinel project; add `scope`
+- [x] **T10** Global scope: reserve the `_global` sentinel project; add `scope`
       (`project|global`) to `mem_save` and the observations endpoint; add `mem_promote` to
       move an observation from project to global (preserving/rewriting `topic_key`).
-- [ ] **T11** Cross-scope search: `mem_search` / `/api/search` accept
+- [x] **T11** Cross-scope search: `mem_search` / `/api/search` accept
       `scope=project|global|all` (default `all`), returning global hits marked with their
       origin so the model can tell a repo fact from a universal heuristic.
-- [ ] **T12** Global dedup: upsert by `topic_key` works identically in the global scope, so a
+- [x] **T12** Global dedup: upsert by `topic_key` works identically in the global scope, so a
       heuristic taught twice updates in place instead of accumulating.
 
 ### Slice 3 — review loop (no token overhead)
@@ -366,4 +373,95 @@ Observed evidence (`dotnet --version` = `10.0.401`):
   "HanniPI integration constraints" section (T20–T22) from the preceding session; it is a
   doc-only change to this same file and is folded into this slice's documentation commit instead
   of being left dirty or dropped.
+
+### Slice 2 — scopes implemented and verified (2026-10-15)
+
+Work-unit commits on `feat/memory-v2` (tests ship inside the commit that changes the behaviour
+they verify):
+
+| Task | Commit | Summary |
+|---|---|---|
+| — (infra) | `c6e923f` | `test(core): serialize the suite that clears the shared Sqlite pool` |
+| T10 | `c67f781` | `feat(core): add the reserved global memory scope and a project guard` |
+| T11 | `4c4749f` | `feat(core): return project and global hits together with their origin scope` |
+| T12 | `3633dad` | `test(core): prove the global scope dedups by topic_key in place` |
+| T10 (promote) | `1a12cdd` | `feat(core): promote a project memory into the global scope` |
+
+`SchemaVersion` stays **3** — the global scope reuses the existing `projects` / `observations` /
+`observations_fts` / upsert-by-`topic_key` machinery with no new table and no schema change.
+
+Observed evidence (`dotnet --version` = `10.0.401`; restore from the local NuGet cache; the only
+restore noise is `NU1900` for the unreachable private feed `treball.original-soft.com`):
+
+- `dotnet build HanniGram.slnx -c Release --nologo` → 0 errors (9 warnings: 8 `NU1900`, plus the
+  pre-existing `CS8604` in `Program.cs`).
+- `dotnet test HanniGram.slnx -c Release --nologo` → **87 passed, 0 failed** (58 before this
+  slice), stable across 12 consecutive runs.
+- Each behaviour was temporarily reverted and its tests re-run before restoring, to prove the
+  tests detect the gap:
+  - **T10** (sentinel guard disabled in `ProjectResolver.Resolve`):
+    `Resolve_NeverReturnsTheGlobalSentinel_ForADirectoryNamedLikeIt` failed
+    `Assert.NotEqual() Failure: Strings are equal`.
+  - **T11** (global namespace excluded from the read set): 3 cross-scope tests failed — the
+    "all returns both origins" and "global hit is labelled" assertions.
+  - **T12** (upsert disabled in the global scope): 2 `GlobalDedupTests` failed.
+  - **Promotion** (merge branch disabled): `Promote_WithExistingGlobalTopicKey_...` failed
+    `Assert.True() Failure`.
+- End-to-end against a **daemon built from source**, `HANNIGRAM_DB` = temp file,
+  `HANNIGRAM_URLS=http://127.0.0.1:8797`; server stopped and temp dir removed afterwards. The real
+  db (`~/.hannigram/hannigram.db`) and the live daemon on 8765 were never touched — the db mtime
+  was byte-identical before and after (`2026-10-15T07:30:30.5035170Z`); port 8797 confirmed closed.
+  - Fresh-db reads (`scope=global`, `scope=all`) created **no** `_global` row: read paths never
+    materialize the sentinel.
+  - A memory saved with `scope=global` was retrieved from a **different** project:
+    `scope=all` → 1 global hit, `scope=project` → 0, `scope=global` → 1. `scope=all` → 2 hits
+    labelled `project` + `global`. Proves T10 + T11.
+  - Promotion, **no collision** → `outcome=moved`, the memory is found from another project and is
+    gone from the originating project (same id, `topic_key` preserved).
+  - Promotion, **collision** → `outcome=merged`: the promoted content overwrote the existing global
+    row in place (title `Collide v2`, content `betatronnew`), the new term is found, the removed
+    term is gone, and `topicKey=heuristics/collide2` returns **1** hit (not duplicated); global
+    count stayed consistent (4).
+  - E2E caveat: the first collision check used `collideoldmarker` / `collidenewmarker`, which share
+    trigrams, so the "removed" term still matched via the documented trigram fallback. Rerunning
+    with trigram-disjoint `alpenglowold` / `betatronnew` gave the expected `0` hits for the removed
+    term — the same fixture constraint recorded in Slice 1.
+
+CLI / API surface (the MCP wrapper is Slice 4):
+
+- `POST /api/observations` accepts `scope` in the body (`project` default, `global` writes the
+  shared sentinel namespace).
+- `GET /api/search` and `GET /api/observations` accept `scope=project|global|all` (default `all`).
+- `POST /api/observations/{id}/promote?cwd=` returns `{ observation, merged, outcome:
+  "moved"|"merged" }`.
+- CLI: `hannigram save … [--scope project|global]`, `hannigram search … [--scope
+  project|global|all]` (default `all`; each hit printed with its `(scope)`).
+
+### What changed the plan (Slice 2)
+
+- **The global namespace is a reserved sentinel project, not a second table.** `_global`
+  (`HanniGram.Core.MemoryScopes.GlobalProjectName`) is a real row in `projects`; saves reuse the
+  same upsert-by-`topic_key`, the same FTS triggers, and the same recency ordering. `SchemaVersion`
+  therefore did not move.
+- **Reads must never create the sentinel, and `Resolve` must never return it.** The store resolves
+  read namespaces through `NamespacesFor(projectId, scope, defaultScope)`, which looks the sentinel
+  up read-only (absent → no global hits); only the write path calls `GetOrCreateGlobalProject()`.
+  `ProjectResolver.GuardAgainstSentinel` rejects `_global` as a resolved project so a directory
+  named `_global` cannot be mistaken for the shared namespace.
+- **Origin is derived from identity, not from the request.** `Observation.Scope` / `SearchHit.Scope`
+  are stamped from the row's `project_id` via `ScopeOfProject`, so the id-based overloads and
+  `NamespacesFor` always label a global row `global` even when addressed as a project id. A test
+  (`SentinelAddressedAsAProject_IsStillLabelledGlobal`) pins this; the fix was exposed by a
+  promotion test and folded into the promotion commit.
+- **Promotion collision = overwrite-in-place, not reject.** When the destination global namespace
+  already owns the `topic_key` (a different row id), the promoted content overwrites the existing
+  global row and the redundant project row is deleted; the FTS triggers keep the index correct with
+  no rebuild. No collision → the row is moved (same id, `topic_key` preserved). This is the
+  "taught it 100 times" path: the latest teaching wins instead of accumulating duplicates.
+- **The suite was serialized to kill a pre-existing flake.** `FtsTriggerTests` calls the
+  process-wide `SqliteConnection.ClearAllPools()`, which races other xUnit classes because pools are
+  keyed by the exact connection string; the observable symptom was an intermittent
+  `ObjectDisposedException`. `[assembly: CollectionBehavior(DisableTestParallelization = true)]`
+  fixes it (12/12 stable runs). This is infrastructure, not scope behaviour, so it is its own commit
+  (`c6e923f`) ahead of T10.
 
