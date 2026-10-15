@@ -418,7 +418,34 @@ public sealed class HanniGramStore : IDisposable
     {
         lock (_gate)
         {
-            return ReadObservationById(projectId, id, null);
+            var observation = ReadObservationById(projectId, id, null);
+            // This overload is project-scoped by definition; the global and
+            // cross-scope paths stamp their own origin.
+            if (observation is not null) observation.Scope = MemoryScopes.Project;
+            return observation;
+        }
+    }
+
+    /// <summary>
+    /// Build the namespace list for a read from a scope selector. The global
+    /// namespace is looked up READ-ONLY, so a cross-scope read never creates the
+    /// sentinel. A null <paramref name="projectId"/> omits the project namespace
+    /// (used when the selector is global-only, so no project row is created).
+    /// </summary>
+    public IReadOnlyList<MemoryNamespace> NamespacesFor(long? projectId, string? scope, string defaultScope)
+    {
+        lock (_gate)
+        {
+            var (includeProject, includeGlobal) = MemoryScopes.Selection(scope, defaultScope);
+            var list = new List<MemoryNamespace>();
+            if (includeProject && projectId is not null)
+                list.Add(new MemoryNamespace(projectId.Value, MemoryScopes.Project));
+            if (includeGlobal)
+            {
+                var global = ReadProjectByName(MemoryScopes.GlobalProjectName, null);
+                if (global is not null) list.Add(new MemoryNamespace(global.Id, MemoryScopes.Global));
+            }
+            return list;
         }
     }
 
@@ -451,20 +478,44 @@ public sealed class HanniGramStore : IDisposable
     }
 
     public IReadOnlyList<Observation> ListObservations(long projectId, int limit = 50)
+        => ListObservations(new[] { new MemoryNamespace(projectId, MemoryScopes.Project) }, limit);
+
+    /// <summary>
+    /// List observations across every requested namespace, stamping each row
+    /// with its origin scope. Bounded by <paramref name="limit"/> and ordered
+    /// deterministically (updated_at_utc, then id).
+    /// </summary>
+    public IReadOnlyList<Observation> ListObservations(IReadOnlyList<MemoryNamespace> namespaces, int limit = 50)
     {
         lock (_gate)
         {
             limit = ClampLimit(limit);
             var list = new List<Observation>();
+            if (namespaces.Count == 0) return list;
+
+            var ids = namespaces.Select(n => n.ProjectId).Distinct().ToArray();
+            var scopeById = new Dictionary<long, string>();
+            foreach (var n in namespaces) scopeById[n.ProjectId] = n.Scope;
+
             using var cmd = CreateCommand();
             // updated_at_utc is the real recency signal: a topic-key upsert keeps
             // created_at_utc, so ordering by created_at would bury a memory that
-            // just evolved at its original position.
-            cmd.CommandText = "SELECT id, project_id, title, content, what, why, where_, learned, topic_key, type, created_at_utc, updated_at_utc FROM observations WHERE project_id = $p ORDER BY updated_at_utc DESC LIMIT $l";
-            cmd.Parameters.AddWithValue("$p", projectId);
+            // just evolved at its original position. id breaks ties deterministically.
+            cmd.CommandText =
+                "SELECT id, project_id, title, content, what, why, where_, learned, topic_key, type, created_at_utc, updated_at_utc FROM observations WHERE project_id IN ("
+                + string.Join(", ", ids.Select((_, i) => "$p" + i))
+                + ") ORDER BY updated_at_utc DESC, id DESC LIMIT $l";
+            for (var i = 0; i < ids.Length; i++) cmd.Parameters.AddWithValue("$p" + i, ids[i]);
             cmd.Parameters.AddWithValue("$l", limit);
             using var r = cmd.ExecuteReader();
-            while (r.Read()) list.Add(ReadObservation(r));
+            while (r.Read())
+            {
+                var observation = ReadObservation(r);
+                observation.Scope = scopeById.TryGetValue(observation.ProjectId, out var scope)
+                    ? scope
+                    : MemoryScopes.Project;
+                list.Add(observation);
+            }
             return list;
         }
     }
@@ -485,10 +536,24 @@ public sealed class HanniGramStore : IDisposable
     }
 
     public IReadOnlyList<SearchHit> Search(long projectId, string query, int limit = 10, string? type = null, string? topicKey = null)
+        => Search(new[] { new MemoryNamespace(projectId, MemoryScopes.Project) }, query, limit, type, topicKey);
+
+    /// <summary>
+    /// Cross-scope search: one FTS pass over every requested namespace. Each hit
+    /// carries its origin scope so a caller can tell a repo fact from a universal
+    /// heuristic. Results stay bounded by <paramref name="limit"/> and ordered
+    /// deterministically (bm25 rank, then id).
+    /// </summary>
+    public IReadOnlyList<SearchHit> Search(IReadOnlyList<MemoryNamespace> namespaces, string query, int limit = 10, string? type = null, string? topicKey = null)
     {
         lock (_gate)
         {
             limit = ClampLimit(limit);
+            if (namespaces.Count == 0)
+            {
+                return Array.Empty<SearchHit>();
+            }
+
             // FtsQuery drops every term shorter than the trigram minimum, so "ab",
             // "a", "" and whitespace-only all escape to the empty string. FTS5
             // rejects MATCH '' with `fts5: syntax error near ""`, which used to
@@ -500,7 +565,7 @@ public sealed class HanniGramStore : IDisposable
                 return Array.Empty<SearchHit>();
             }
 
-            var hits = SearchCore(projectId, ftsQuery, limit, type, topicKey);
+            var hits = SearchCore(namespaces, ftsQuery, limit, type, topicKey);
             // Trigram tokenizer matches substrings, not fuzzy typos. When a strict
             // AND match finds nothing, retry with OR of the query's trigrams so a
             // typo'd word (1-3 chars off in a long word) still matches documents
@@ -510,40 +575,51 @@ public sealed class HanniGramStore : IDisposable
                 var fallback = FtsTrigramFallback(query);
                 if (fallback.Length != 0)
                 {
-                    hits = SearchCore(projectId, fallback, limit, type, topicKey);
+                    hits = SearchCore(namespaces, fallback, limit, type, topicKey);
                 }
             }
             return hits;
         }
     }
 
-    private List<SearchHit> SearchCore(long projectId, string ftsQuery, int limit, string? type = null, string? topicKey = null)
+    private List<SearchHit> SearchCore(IReadOnlyList<MemoryNamespace> namespaces, string ftsQuery, int limit, string? type = null, string? topicKey = null)
     {
         var list = new List<SearchHit>();
         // Hard guarantee for every caller, including the trigram fallback: an FTS5
         // MATCH is never issued with an empty expression.
-        if (string.IsNullOrEmpty(ftsQuery))
+        if (string.IsNullOrEmpty(ftsQuery) || namespaces.Count == 0)
         {
             return list;
         }
+
+        var ids = namespaces.Select(n => n.ProjectId).Distinct().ToArray();
+        var scopeById = new Dictionary<long, string>();
+        foreach (var n in namespaces) scopeById[n.ProjectId] = n.Scope;
+
         using var cmd = CreateCommand();
+        // One MATCH across every requested project_id keeps bm25 comparable
+        // between scopes; ORDER BY (rank, id) is deterministic and LIMIT bounds
+        // the merged result set.
         var sql = @"
-            SELECT o.id, o.title, o.content, o.topic_key, o.type, o.created_at_utc, bm25(observations_fts) AS rank
+            SELECT o.id, o.title, o.content, o.topic_key, o.type, o.created_at_utc, bm25(observations_fts) AS rank, o.project_id
             FROM observations_fts
             JOIN observations o ON o.id = observations_fts.rowid
-            WHERE observations_fts MATCH $q AND o.project_id = $p";
+            WHERE observations_fts MATCH $q AND o.project_id IN (";
+        sql += string.Join(", ", ids.Select((_, i) => "$p" + i));
+        sql += ")";
         if (type is not null) sql += " AND o.type = $ty";
         if (topicKey is not null) sql += " AND o.topic_key = $tk";
-        sql += "\n            ORDER BY rank\n            LIMIT $l;";
+        sql += "\n            ORDER BY rank, o.id\n            LIMIT $l;";
         cmd.CommandText = sql;
         cmd.Parameters.AddWithValue("$q", ftsQuery);
-        cmd.Parameters.AddWithValue("$p", projectId);
+        for (var i = 0; i < ids.Length; i++) cmd.Parameters.AddWithValue("$p" + i, ids[i]);
         if (type is not null) cmd.Parameters.AddWithValue("$ty", type);
         if (topicKey is not null) cmd.Parameters.AddWithValue("$tk", topicKey);
         cmd.Parameters.AddWithValue("$l", limit);
         using var r = cmd.ExecuteReader();
         while (r.Read())
         {
+            var projectId = r.GetInt64(7);
             list.Add(new SearchHit
             {
                 Id = r.GetInt64(0),
@@ -553,6 +629,7 @@ public sealed class HanniGramStore : IDisposable
                 Type = r.IsDBNull(4) ? null : r.GetString(4),
                 CreatedAtUtc = DateTime.Parse(r.GetString(5), null, System.Globalization.DateTimeStyles.RoundtripKind),
                 Rank = r.IsDBNull(6) ? 0 : r.GetDouble(6),
+                Scope = scopeById.TryGetValue(projectId, out var scope) ? scope : MemoryScopes.Project,
             });
         }
         return list;

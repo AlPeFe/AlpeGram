@@ -31,6 +31,11 @@ public sealed class Observation
     public string? Type { get; set; }
     public DateTime CreatedAtUtc { get; set; }
     public DateTime UpdatedAtUtc { get; set; }
+    /// <summary>
+    /// Origin scope ("project" or "global"). Lets a caller tell a repo fact
+    /// from a universal heuristic. Set on every read path.
+    /// </summary>
+    public string? Scope { get; set; }
 }
 
 /// <summary>
@@ -59,4 +64,15 @@ public sealed class SearchHit
     public string? Type { get; set; }
     public DateTime CreatedAtUtc { get; set; }
     public double Rank { get; set; }
+    /// <summary>
+    /// Origin scope ("project" or "global") of the hit, so a cross-scope search
+    /// can distinguish a repo fact from a universal heuristic.
+    /// </summary>
+    public string? Scope { get; set; }
 }
+
+/// <summary>
+/// One namespace to include in a cross-scope read: a project id plus the origin
+/// label ("project" or "global") stamped onto every row it returns.
+/// </summary>
+public readonly record struct MemoryNamespace(long ProjectId, string Scope);

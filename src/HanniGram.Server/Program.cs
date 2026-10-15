@@ -60,16 +60,14 @@ Project ResolveProject(HttpRequest req)
     return store.GetOrCreateProject(name, string.IsNullOrEmpty(cwd) ? null : cwd);
 }
 
-// The global namespace is shared by every project. Read paths look it up
-// WITHOUT creating it, so a project that never wrote global memory does not
-// spawn the sentinel; only writes create it. Returns null when no global
-// memory exists yet.
-long? GlobalProjectIdOrNull() => store.GetGlobalProject()?.Id;
-
-// The project id a single-scope read should target. "project" resolves and (as
-// before) creates the caller's own project; "global" only reads the sentinel.
-long? ScopeReadProjectId(HttpRequest req, string scope) =>
-    scope == MemoryScopes.Global ? GlobalProjectIdOrNull() : ResolveProject(req).Id;
+// The global namespace is shared by every project. Read paths resolve it
+// READ-ONLY through the store (NamespacesFor), so a project that never wrote
+// global memory does not spawn the sentinel; only writes create it.
+long? ProjectIdForRead(HttpRequest req, string? scope, string defaultScope)
+{
+    var (includeProject, _) = MemoryScopes.Selection(scope, defaultScope);
+    return includeProject ? ResolveProject(req).Id : null;
+}
 
 // ---- Health ----
 app.MapGet("/health", () => Results.Json(new { status = "ok", db = dbPath }, json));
@@ -97,6 +95,7 @@ app.MapPost("/api/observations", (HttpRequest req, ObservationBody body) =>
     var (obs, created) = store.SaveObservation(
         projectId, body.Title, body.Content ?? "",
         body.What, body.Why, body.Where, body.Learned, body.TopicKey, body.Type);
+    obs.Scope = scope;
     return Results.Json(new { observation = obs, created, scope }, json);
 });
 
@@ -116,11 +115,8 @@ app.MapDelete("/api/observations/{id:long}", (long id, HttpRequest req) =>
 
 app.MapGet("/api/observations", (HttpRequest req, int limit = 50, string? scope = null) =>
 {
-    var s = MemoryScopes.ResolveScope(scope, MemoryScopes.Project);
-    var projectId = ScopeReadProjectId(req, s);
-    return projectId is null
-        ? Results.Json(Array.Empty<Observation>(), json)
-        : Results.Json(store.ListObservations(projectId.Value, limit), json);
+    var namespaces = store.NamespacesFor(ProjectIdForRead(req, scope, MemoryScopes.All), scope, MemoryScopes.All);
+    return Results.Json(store.ListObservations(namespaces, limit), json);
 });
 
 app.MapGet("/api/observations/topic/{topicKey}", (string topicKey, HttpRequest req) =>
@@ -132,11 +128,8 @@ app.MapGet("/api/observations/topic/{topicKey}", (string topicKey, HttpRequest r
 // ---- Search (FTS5) ----
 app.MapGet("/api/search", (HttpRequest req, string q, int limit = 10, string? type = null, string? topicKey = null, string? scope = null) =>
 {
-    var s = MemoryScopes.ResolveScope(scope, MemoryScopes.Project);
-    var projectId = ScopeReadProjectId(req, s);
-    return projectId is null
-        ? Results.Json(Array.Empty<SearchHit>(), json)
-        : Results.Json(store.Search(projectId.Value, q, limit, type, topicKey), json);
+    var namespaces = store.NamespacesFor(ProjectIdForRead(req, scope, MemoryScopes.All), scope, MemoryScopes.All);
+    return Results.Json(store.Search(namespaces, q, limit, type, topicKey), json);
 });
 
 // ---- Topic keys ----

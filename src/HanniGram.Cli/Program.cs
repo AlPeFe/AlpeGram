@@ -94,16 +94,17 @@ try
         case "search":
         {
             var q = rest.FirstOrDefault(a => !a.StartsWith("--")) ?? throw new ArgumentException("query required");
-            var scope = MemoryScopes.ResolveScope(Flag(rest, "--scope"), MemoryScopes.Project);
+            // Cross-scope by default: project hits and global heuristics in one
+            // result set, each tagged with its origin. A global search reads the
+            // sentinel through NamespacesFor WITHOUT creating it.
+            var scope = Flag(rest, "--scope");
             var limit = IntFlag(rest, "--limit", 10);
-            // A global search reads the sentinel WITHOUT creating it: no global
-            // memory yet means no hits, not an empty namespace worth inserting.
-            long? projectId = scope == MemoryScopes.Global
-                ? store.GetGlobalProject()?.Id
-                : store.GetOrCreateProject(resolvedProject, cwd).Id;
-            if (projectId is null) break;
-            foreach (var hit in store.Search(projectId.Value, q, limit))
-                Console.WriteLine($"[{hit.Rank:F2}] #{hit.Id} {hit.Title} — {Truncate(hit.Content, 80)}");
+            var projectId = MemoryScopes.Selection(scope, MemoryScopes.All).IncludeProject
+                ? store.GetOrCreateProject(resolvedProject, cwd).Id
+                : (long?)null;
+            var namespaces = store.NamespacesFor(projectId, scope, MemoryScopes.All);
+            foreach (var hit in store.Search(namespaces, q, limit))
+                Console.WriteLine($"[{hit.Rank:F2}] ({hit.Scope}) #{hit.Id} {hit.Title} — {Truncate(hit.Content, 80)}");
             break;
         }
 
@@ -170,15 +171,16 @@ static void Help() => Console.WriteLine("""
     Usage:
       hannigram project [cwd]
       hannigram save <title> [--content] [--what] [--why] [--where] [--learned] [--topic] [--type] [--scope project|global] [--project] [--cwd]
-      hannigram search <query> [--limit] [--scope project|global] [--project] [--cwd]
+      hannigram search <query> [--limit] [--scope project|global|all] [--project] [--cwd]
       hannigram list [--limit] [--project] [--cwd]
       hannigram topics [--project] [--cwd]
       hannigram session-start [--id] [--project] [--cwd]
       hannigram session-end <id> [--summary] [--goal] [--next] [--project] [--cwd]
       hannigram projects
 
-    Scope: --scope global reads/writes the shared cross-project memory; the
-    default project scope reads/writes the caller's own namespace.
+    Scope: save defaults to the caller's project namespace; --scope global writes
+    the shared cross-project memory. search defaults to --scope all (project and
+    global hits, each tagged with its origin); use project or global to narrow it.
 
     Env: HANNIGRAM_DB (db path), HANNIGRAM_CWD (default cwd)
     """);
