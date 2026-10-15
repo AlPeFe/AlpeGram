@@ -5,7 +5,7 @@ All notable changes to HanniGram are documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.2.0] - 2026-10-15
 
 ### Added
 
@@ -38,7 +38,6 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   payloads to match the MCP server caps; `mem_timeline` is also hard-capped at 50
   rows per key. Previously a single 6000-character body reached the model intact.
 
-## [0.2.0] - 2026-10-15
 
 Hardening of the memory engine plus the features the product actually needed:
 memory scopes, a cheap review/lifecycle loop, and a portable MCP surface.
