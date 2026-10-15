@@ -113,6 +113,19 @@ app.MapDelete("/api/observations/{id:long}", (long id, HttpRequest req) =>
     return deleted ? Results.Ok(new { deleted = true, id }) : Results.NotFound();
 });
 
+// Promote a project memory to the global scope: the "I have taught this 100
+// times" path. When a global memory already owns the topic_key, the promoted
+// content wins and the redundant project row is removed; the response says which
+// of the two happened.
+app.MapPost("/api/observations/{id:long}/promote", (long id, HttpRequest req) =>
+{
+    var p = ResolveProject(req);
+    var result = store.PromoteObservation(p.Id, id);
+    if (result is null) return Results.NotFound();
+    var (observation, merged) = result.Value;
+    return Results.Json(new { observation, merged, outcome = merged ? "merged" : "moved" }, json);
+});
+
 app.MapGet("/api/observations", (HttpRequest req, int limit = 50, string? scope = null) =>
 {
     var namespaces = store.NamespacesFor(ProjectIdForRead(req, scope, MemoryScopes.All), scope, MemoryScopes.All);

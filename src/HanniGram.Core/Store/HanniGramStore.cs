@@ -419,10 +419,26 @@ public sealed class HanniGramStore : IDisposable
         lock (_gate)
         {
             var observation = ReadObservationById(projectId, id, null);
-            // This overload is project-scoped by definition; the global and
-            // cross-scope paths stamp their own origin.
-            if (observation is not null) observation.Scope = MemoryScopes.Project;
+            if (observation is not null) observation.Scope = ScopeOfProject(projectId);
             return observation;
+        }
+    }
+
+    /// <summary>
+    /// The origin scope of a namespace identified only by id, derived from the
+    /// project's name so an id-based caller cannot mislabel the global sentinel
+    /// as a project (or a project as global).
+    /// </summary>
+    private string ScopeOfProject(long projectId)
+    {
+        lock (_gate)
+        {
+            using var cmd = CreateCommand();
+            cmd.CommandText = "SELECT name FROM projects WHERE id = $id";
+            cmd.Parameters.AddWithValue("$id", projectId);
+            return cmd.ExecuteScalar() as string == MemoryScopes.GlobalProjectName
+                ? MemoryScopes.Global
+                : MemoryScopes.Project;
         }
     }
 
@@ -439,11 +455,17 @@ public sealed class HanniGramStore : IDisposable
             var (includeProject, includeGlobal) = MemoryScopes.Selection(scope, defaultScope);
             var list = new List<MemoryNamespace>();
             if (includeProject && projectId is not null)
-                list.Add(new MemoryNamespace(projectId.Value, MemoryScopes.Project));
+            {
+                // Derive the label from the namespace's identity so an explicit
+                // ?project=_global cannot stamp global rows as "project".
+                var label = ScopeOfProject(projectId.Value);
+                list.Add(new MemoryNamespace(projectId.Value, label));
+            }
             if (includeGlobal)
             {
                 var global = ReadProjectByName(MemoryScopes.GlobalProjectName, null);
-                if (global is not null) list.Add(new MemoryNamespace(global.Id, MemoryScopes.Global));
+                if (global is not null && !list.Any(n => n.ProjectId == global.Id))
+                    list.Add(new MemoryNamespace(global.Id, MemoryScopes.Global));
             }
             return list;
         }
@@ -465,11 +487,7 @@ public sealed class HanniGramStore : IDisposable
         lock (_gate)
         {
             using var tx = _conn.BeginTransaction();
-            using var cmd = CreateCommand(tx);
-            cmd.CommandText = "DELETE FROM observations WHERE id = $id AND project_id = $p";
-            cmd.Parameters.AddWithValue("$id", id);
-            cmd.Parameters.AddWithValue("$p", projectId);
-            var deleted = cmd.ExecuteNonQuery() > 0;
+            var deleted = DeleteObservationTx(projectId, id, tx);
             // The AFTER DELETE trigger drops the row from the external-content
             // index inside this same transaction; no corpus rebuild is needed.
             tx.Commit();
@@ -477,8 +495,97 @@ public sealed class HanniGramStore : IDisposable
         }
     }
 
+    private bool DeleteObservationTx(long projectId, long id, SqliteTransaction tx)
+    {
+        using var cmd = CreateCommand(tx);
+        cmd.CommandText = "DELETE FROM observations WHERE id = $id AND project_id = $p";
+        cmd.Parameters.AddWithValue("$id", id);
+        cmd.Parameters.AddWithValue("$p", projectId);
+        return cmd.ExecuteNonQuery() > 0;
+    }
+
+    /// <summary>
+    /// Promote a project observation to the global namespace.
+    /// <para>
+    /// No collision: the row is MOVED (its project_id is reassigned), keeping its
+    /// id and topic_key. Collision (a global memory already owns the topic_key):
+    /// the promoted content WINS — the existing global row is updated in place and
+    /// the now-redundant project row is deleted, so nothing is duplicated and the
+    /// newer content is not discarded. The FTS sync triggers keep the index
+    /// correct through the UPDATE and DELETE; no rebuild.
+    /// </para>
+    /// Returns null when the observation is not in the project; the bool is true
+    /// when the promotion merged into an existing global row.
+    /// </summary>
+    public (Observation Observation, bool Merged)? PromoteObservation(long projectId, long id)
+    {
+        lock (_gate)
+        {
+            using var tx = _conn.BeginTransaction();
+            var source = ReadObservationById(projectId, id, tx);
+            if (source is null)
+            {
+                tx.Commit();
+                return null;
+            }
+
+            var global = GetOrCreateProjectCore(MemoryScopes.GlobalProjectName, null, tx);
+
+            // A global row with the same topic key (and not the source itself,
+            // which is only possible if the caller already passed the global
+            // namespace) triggers the merge path.
+            var existing = string.IsNullOrEmpty(source.TopicKey)
+                ? null
+                : FindLatestByTopicKey(global.Id, source.TopicKey, tx);
+            if (existing is not null && existing.Id != source.Id)
+            {
+                using (var update = CreateCommand(tx))
+                {
+                    update.CommandText = @"
+                        UPDATE observations
+                        SET title = $t, content = $c, what = $w, why = $y, where_ = $wh, learned = $l, type = $ty, updated_at_utc = $n
+                        WHERE id = $id";
+                    update.Parameters.AddWithValue("$t", source.Title);
+                    update.Parameters.AddWithValue("$c", source.Content);
+                    update.Parameters.AddWithValue("$w", (object?)source.What ?? DBNull.Value);
+                    update.Parameters.AddWithValue("$y", (object?)source.Why ?? DBNull.Value);
+                    update.Parameters.AddWithValue("$wh", (object?)source.Where ?? DBNull.Value);
+                    update.Parameters.AddWithValue("$l", (object?)source.Learned ?? DBNull.Value);
+                    update.Parameters.AddWithValue("$ty", (object?)source.Type ?? DBNull.Value);
+                    update.Parameters.AddWithValue("$n", Now());
+                    update.Parameters.AddWithValue("$id", existing.Id);
+                    update.ExecuteNonQuery();
+                }
+
+                // The project row is now redundant: the promoted content lives in
+                // the surviving global row.
+                DeleteObservationTx(projectId, source.Id, tx);
+
+                var merged = ReadObservationById(global.Id, existing.Id, tx)!;
+                merged.Scope = MemoryScopes.Global;
+                tx.Commit();
+                return (merged, true);
+            }
+
+            using (var move = CreateCommand(tx))
+            {
+                move.CommandText = "UPDATE observations SET project_id = $g, updated_at_utc = $n WHERE id = $id AND project_id = $p";
+                move.Parameters.AddWithValue("$g", global.Id);
+                move.Parameters.AddWithValue("$n", Now());
+                move.Parameters.AddWithValue("$id", source.Id);
+                move.Parameters.AddWithValue("$p", projectId);
+                move.ExecuteNonQuery();
+            }
+
+            var moved = ReadObservationById(global.Id, source.Id, tx)!;
+            moved.Scope = MemoryScopes.Global;
+            tx.Commit();
+            return (moved, false);
+        }
+    }
+
     public IReadOnlyList<Observation> ListObservations(long projectId, int limit = 50)
-        => ListObservations(new[] { new MemoryNamespace(projectId, MemoryScopes.Project) }, limit);
+        => ListObservations(new[] { new MemoryNamespace(projectId, ScopeOfProject(projectId)) }, limit);
 
     /// <summary>
     /// List observations across every requested namespace, stamping each row
@@ -536,7 +643,7 @@ public sealed class HanniGramStore : IDisposable
     }
 
     public IReadOnlyList<SearchHit> Search(long projectId, string query, int limit = 10, string? type = null, string? topicKey = null)
-        => Search(new[] { new MemoryNamespace(projectId, MemoryScopes.Project) }, query, limit, type, topicKey);
+        => Search(new[] { new MemoryNamespace(projectId, ScopeOfProject(projectId)) }, query, limit, type, topicKey);
 
     /// <summary>
     /// Cross-scope search: one FTS pass over every requested namespace. Each hit

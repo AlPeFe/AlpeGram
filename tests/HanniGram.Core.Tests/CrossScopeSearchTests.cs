@@ -107,6 +107,40 @@ public sealed class CrossScopeSearchTests
         Assert.Contains(listed, o => o.Scope == MemoryScopes.Global);
     }
 
+    // An id-based read of the global namespace must be labelled global, not
+    // assumed to be a project: GetGlobalProject() returns a Project a caller can
+    // pass straight to Search/ListObservations.
+    [Fact]
+    public void IdBasedGlobalRead_IsLabelledGlobal()
+    {
+        using var db = new TempDatabase();
+        using var store = db.OpenStore();
+        var global = store.GetOrCreateGlobalProject();
+        store.SaveObservation(global.Id, "Universal heuristic", Shared + " global body");
+
+        var hit = Assert.Single(store.Search(global.Id, Shared));
+        var listed = Assert.Single(store.ListObservations(global.Id));
+
+        Assert.Equal(MemoryScopes.Global, hit.Scope);
+        Assert.Equal(MemoryScopes.Global, listed.Scope);
+    }
+
+    // Even when the sentinel is addressed explicitly as a project, the origin
+    // label reflects reality rather than the caller's declared scope.
+    [Fact]
+    public void SentinelAddressedAsAProject_IsStillLabelledGlobal()
+    {
+        using var db = new TempDatabase();
+        using var store = db.OpenStore();
+        var global = store.GetOrCreateGlobalProject();
+        store.SaveObservation(global.Id, "Universal heuristic", Shared + " global body");
+
+        var namespaces = store.NamespacesFor(global.Id, MemoryScopes.Project, MemoryScopes.All);
+        var hit = Assert.Single(store.Search(namespaces, Shared));
+
+        Assert.Equal(MemoryScopes.Global, hit.Scope);
+    }
+
     [Fact]
     public void CrossScopeSearch_IsBoundedByTheLimit()
     {
