@@ -32,6 +32,16 @@ public sealed class Observation
     public DateTime CreatedAtUtc { get; set; }
     public DateTime UpdatedAtUtc { get; set; }
     /// <summary>
+    /// Lifecycle state: "active", "needs_review" or "archived". Default reads
+    /// only return "active"; archived is the safe forget.
+    /// </summary>
+    public string State { get; set; } = MemoryStates.Active;
+    /// <summary>
+    /// Pinned flag. Pinned global heuristics are the only global memory allowed
+    /// into the automatic context path (the bounded injection budget).
+    /// </summary>
+    public bool Pinned { get; set; }
+    /// <summary>
     /// Origin scope ("project" or "global"). Lets a caller tell a repo fact
     /// from a universal heuristic. Set on every read path.
     /// </summary>
@@ -64,6 +74,11 @@ public sealed class SearchHit
     public string? Type { get; set; }
     public DateTime CreatedAtUtc { get; set; }
     public double Rank { get; set; }
+    /// <summary>
+    /// Lifecycle state of the hit. Only relevant when the search is asked for a
+    /// non-default state (a default search returns active rows only).
+    /// </summary>
+    public string? State { get; set; }
     /// <summary>
     /// Origin scope ("project" or "global") of the hit, so a cross-scope search
     /// can distinguish a repo fact from a universal heuristic.

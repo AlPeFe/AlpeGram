@@ -37,7 +37,12 @@ public sealed class HanniGramStore : IDisposable
     // v3: sessions gain a unique (project_id, session_id) index, so a session
     //     summary re-saved for the same session updates one row instead of
     //     accumulating duplicates. The v3 migration deduplicates first.
-    private const int SchemaVersion = 3;
+    // v4: observations gain a lifecycle state (active|needs_review|archived) and a
+    //     pinned flag, so current truth can be told from stale truth and the global
+    //     injection budget can select pinned heuristics. Existing rows migrate to
+    //     active / unpinned. The FTS column set is unchanged, but the version bump
+    //     runs the standard one-off FTS recreate (the migration shape is shared).
+    private const int SchemaVersion = 4;
 
     private void Initialize()
     {
@@ -71,7 +76,9 @@ public sealed class HanniGramStore : IDisposable
                 topic_key TEXT,
                 type TEXT,
                 created_at_utc TEXT NOT NULL,
-                updated_at_utc TEXT NOT NULL
+                updated_at_utc TEXT NOT NULL,
+                state TEXT NOT NULL DEFAULT 'active',
+                pinned INTEGER NOT NULL DEFAULT 0
             );
             CREATE TABLE IF NOT EXISTS sessions (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -86,6 +93,16 @@ public sealed class HanniGramStore : IDisposable
             CREATE INDEX IF NOT EXISTS idx_obs_project_updated ON observations(project_id, updated_at_utc DESC);
             CREATE INDEX IF NOT EXISTS idx_sess_project ON sessions(project_id);
         ");
+
+        // Lifecycle columns (v4). CREATE TABLE only covers a fresh database; an
+        // existing observations table needs the columns added in place, so the
+        // ensure step is idempotent and runs on BOTH the migrating and the
+        // already-migrated path, exactly like the FTS triggers and the sessions
+        // index. The state-aware ordering index is likewise re-asserted every open,
+        // but only AFTER the columns exist: on an existing v3 table the index would
+        // otherwise reference a column that is not there yet.
+        EnsureObservationLifecycleColumns();
+        Exec("CREATE INDEX IF NOT EXISTS idx_obs_project_state_updated ON observations(project_id, state, updated_at_utc DESC);");
 
         // FTS5 trigram index: typo-tolerant and substring/CJK search. Built/patched ONLY
         // when the schema version advances, not on every open. The drop+recreate is
@@ -160,6 +177,43 @@ public sealed class HanniGramStore : IDisposable
         DROP TRIGGER IF EXISTS observations_fts_ad;
         DROP TRIGGER IF EXISTS observations_fts_au;
     ");
+
+    // =====================================================================
+    // Lifecycle schema (v4)
+    // =====================================================================
+
+    /// <summary>
+    /// Ensure the <c>state</c> and <c>pinned</c> columns exist on
+    /// <c>observations</c>. Idempotent: once present this is two cheap
+    /// <c>PRAGMA table_info</c> reads. Existing rows land on the column defaults
+    /// (<c>active</c> / <c>0</c>), which is the intended migration — memory written
+    /// before lifecycle existed is current truth until someone says otherwise.
+    /// </summary>
+    private void EnsureObservationLifecycleColumns()
+    {
+        if (!ColumnExists("observations", "state"))
+        {
+            Exec("ALTER TABLE observations ADD COLUMN state TEXT NOT NULL DEFAULT 'active';");
+        }
+        if (!ColumnExists("observations", "pinned"))
+        {
+            Exec("ALTER TABLE observations ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0;");
+        }
+    }
+
+    /// <summary>True when <paramref name="table"/> already has <paramref name="column"/>.</summary>
+    private bool ColumnExists(string table, string column)
+    {
+        using var cmd = CreateCommand();
+        cmd.CommandText = $"PRAGMA table_info({table});";
+        using var r = cmd.ExecuteReader();
+        // table_info columns: cid, name, type, notnull, dflt_value, pk.
+        while (r.Read())
+        {
+            if (string.Equals(r.GetString(1), column, StringComparison.OrdinalIgnoreCase)) return true;
+        }
+        return false;
+    }
 
     // =====================================================================
     // Sessions schema
@@ -406,10 +460,14 @@ public sealed class HanniGramStore : IDisposable
         // Order by updated_at_utc, not created_at_utc: an upsert preserves the
         // original created_at, so created_at ordering would keep returning the
         // stalest duplicate of a topic key.
+        // Archived rows are not upsert targets: a fresh teaching of a forgotten
+        // topic inserts a new active row instead of reviving the archived one, so
+        // the archived row survives as history.
         using var cmd = CreateCommand(transaction);
-        cmd.CommandText = "SELECT id, project_id, title, content, what, why, where_, learned, topic_key, type, created_at_utc, updated_at_utc FROM observations WHERE project_id = $p AND topic_key = $tk ORDER BY updated_at_utc DESC LIMIT 1";
+        cmd.CommandText = "SELECT id, project_id, title, content, what, why, where_, learned, topic_key, type, created_at_utc, updated_at_utc, state, pinned FROM observations WHERE project_id = $p AND topic_key = $tk AND state <> $archived ORDER BY updated_at_utc DESC LIMIT 1";
         cmd.Parameters.AddWithValue("$p", projectId);
         cmd.Parameters.AddWithValue("$tk", topicKey);
+        cmd.Parameters.AddWithValue("$archived", MemoryStates.Archived);
         using var r = cmd.ExecuteReader();
         return r.Read() ? ReadObservation(r) : null;
     }
@@ -474,7 +532,7 @@ public sealed class HanniGramStore : IDisposable
     private Observation? ReadObservationById(long projectId, long id, SqliteTransaction? transaction)
     {
         using var cmd = CreateCommand(transaction);
-        cmd.CommandText = "SELECT id, project_id, title, content, what, why, where_, learned, topic_key, type, created_at_utc, updated_at_utc FROM observations WHERE id = $id AND project_id = $p";
+        cmd.CommandText = "SELECT id, project_id, title, content, what, why, where_, learned, topic_key, type, created_at_utc, updated_at_utc, state, pinned FROM observations WHERE id = $id AND project_id = $p";
         cmd.Parameters.AddWithValue("$id", id);
         cmd.Parameters.AddWithValue("$p", projectId);
         using var r = cmd.ExecuteReader();
@@ -584,15 +642,20 @@ public sealed class HanniGramStore : IDisposable
         }
     }
 
-    public IReadOnlyList<Observation> ListObservations(long projectId, int limit = 50)
-        => ListObservations(new[] { new MemoryNamespace(projectId, ScopeOfProject(projectId)) }, limit);
+    public IReadOnlyList<Observation> ListObservations(long projectId, int limit = 50, string? state = null)
+        => ListObservations(new[] { new MemoryNamespace(projectId, ScopeOfProject(projectId)) }, limit, state);
 
     /// <summary>
     /// List observations across every requested namespace, stamping each row
     /// with its origin scope. Bounded by <paramref name="limit"/> and ordered
-    /// deterministically (updated_at_utc, then id).
+    /// deterministically (pinned, then updated_at_utc, then id).
+    /// <para>
+    /// <paramref name="state"/> selects the lifecycle filter: absent or unknown →
+    /// <c>active</c> only; a concrete state → that state only; <c>all</c> → every
+    /// state. Archived rows are therefore never returned unless explicitly asked.
+    /// </para>
     /// </summary>
-    public IReadOnlyList<Observation> ListObservations(IReadOnlyList<MemoryNamespace> namespaces, int limit = 50)
+    public IReadOnlyList<Observation> ListObservations(IReadOnlyList<MemoryNamespace> namespaces, int limit = 50, string? state = null)
     {
         lock (_gate)
         {
@@ -604,15 +667,20 @@ public sealed class HanniGramStore : IDisposable
             var scopeById = new Dictionary<long, string>();
             foreach (var n in namespaces) scopeById[n.ProjectId] = n.Scope;
 
+            var filter = ReadState(state);
             using var cmd = CreateCommand();
-            // updated_at_utc is the real recency signal: a topic-key upsert keeps
-            // created_at_utc, so ordering by created_at would bury a memory that
-            // just evolved at its original position. id breaks ties deterministically.
+            // pinned floats to the front deterministically, then updated_at_utc is the
+            // real recency signal: a topic-key upsert keeps created_at_utc, so ordering
+            // by created_at would bury a memory that just evolved at its original
+            // position. id breaks ties deterministically.
             cmd.CommandText =
-                "SELECT id, project_id, title, content, what, why, where_, learned, topic_key, type, created_at_utc, updated_at_utc FROM observations WHERE project_id IN ("
+                "SELECT id, project_id, title, content, what, why, where_, learned, topic_key, type, created_at_utc, updated_at_utc, state, pinned FROM observations WHERE project_id IN ("
                 + string.Join(", ", ids.Select((_, i) => "$p" + i))
-                + ") ORDER BY updated_at_utc DESC, id DESC LIMIT $l";
+                + ")";
+            if (!MemoryStates.IsAll(filter)) cmd.CommandText += " AND state = $st";
+            cmd.CommandText += " ORDER BY pinned DESC, updated_at_utc DESC, id DESC LIMIT $l";
             for (var i = 0; i < ids.Length; i++) cmd.Parameters.AddWithValue("$p" + i, ids[i]);
+            if (!MemoryStates.IsAll(filter)) cmd.Parameters.AddWithValue("$st", filter);
             cmd.Parameters.AddWithValue("$l", limit);
             using var r = cmd.ExecuteReader();
             while (r.Read())
@@ -627,13 +695,20 @@ public sealed class HanniGramStore : IDisposable
         }
     }
 
+    /// <summary>Resolve a read's state selector to a concrete state or the <c>all</c> token.</summary>
+    private static string ReadState(string? state) =>
+        MemoryStates.IsAll(state) ? MemoryStates.All : MemoryStates.Resolve(state, MemoryStates.Active);
+
     public IReadOnlyList<Observation> GetByTopicKey(long projectId, string topicKey)
     {
         lock (_gate)
         {
             var list = new List<Observation>();
             using var cmd = CreateCommand();
-            cmd.CommandText = "SELECT id, project_id, title, content, what, why, where_, learned, topic_key, type, created_at_utc, updated_at_utc FROM observations WHERE project_id = $p AND topic_key = $tk ORDER BY created_at_utc DESC";
+            // No state filter: a timeline by key is an exact lookup, so it shows the
+            // full history including archived rows. The default state filter applies
+            // to search and recency listing, not to a deliberate by-key read.
+            cmd.CommandText = "SELECT id, project_id, title, content, what, why, where_, learned, topic_key, type, created_at_utc, updated_at_utc, state, pinned FROM observations WHERE project_id = $p AND topic_key = $tk ORDER BY created_at_utc DESC";
             cmd.Parameters.AddWithValue("$p", projectId);
             cmd.Parameters.AddWithValue("$tk", topicKey);
             using var r = cmd.ExecuteReader();
@@ -642,16 +717,22 @@ public sealed class HanniGramStore : IDisposable
         }
     }
 
-    public IReadOnlyList<SearchHit> Search(long projectId, string query, int limit = 10, string? type = null, string? topicKey = null)
-        => Search(new[] { new MemoryNamespace(projectId, ScopeOfProject(projectId)) }, query, limit, type, topicKey);
+    public IReadOnlyList<SearchHit> Search(long projectId, string query, int limit = 10, string? type = null, string? topicKey = null, string? state = null)
+        => Search(new[] { new MemoryNamespace(projectId, ScopeOfProject(projectId)) }, query, limit, type, topicKey, state);
 
     /// <summary>
     /// Cross-scope search: one FTS pass over every requested namespace. Each hit
     /// carries its origin scope so a caller can tell a repo fact from a universal
     /// heuristic. Results stay bounded by <paramref name="limit"/> and ordered
     /// deterministically (bm25 rank, then id).
+    /// <para>
+    /// <paramref name="state"/> selects the lifecycle filter exactly like
+    /// <see cref="ListObservations(IReadOnlyList{MemoryNamespace}, int, string?)"/>:
+    /// absent or unknown → <c>active</c> only; a concrete state → that state only;
+    /// <c>all</c> → every state. Archived rows are never returned by default.
+    /// </para>
     /// </summary>
-    public IReadOnlyList<SearchHit> Search(IReadOnlyList<MemoryNamespace> namespaces, string query, int limit = 10, string? type = null, string? topicKey = null)
+    public IReadOnlyList<SearchHit> Search(IReadOnlyList<MemoryNamespace> namespaces, string query, int limit = 10, string? type = null, string? topicKey = null, string? state = null)
     {
         lock (_gate)
         {
@@ -672,7 +753,8 @@ public sealed class HanniGramStore : IDisposable
                 return Array.Empty<SearchHit>();
             }
 
-            var hits = SearchCore(namespaces, ftsQuery, limit, type, topicKey);
+            var filter = ReadState(state);
+            var hits = SearchCore(namespaces, ftsQuery, limit, type, topicKey, filter);
             // Trigram tokenizer matches substrings, not fuzzy typos. When a strict
             // AND match finds nothing, retry with OR of the query's trigrams so a
             // typo'd word (1-3 chars off in a long word) still matches documents
@@ -682,14 +764,14 @@ public sealed class HanniGramStore : IDisposable
                 var fallback = FtsTrigramFallback(query);
                 if (fallback.Length != 0)
                 {
-                    hits = SearchCore(namespaces, fallback, limit, type, topicKey);
+                    hits = SearchCore(namespaces, fallback, limit, type, topicKey, filter);
                 }
             }
             return hits;
         }
     }
 
-    private List<SearchHit> SearchCore(IReadOnlyList<MemoryNamespace> namespaces, string ftsQuery, int limit, string? type = null, string? topicKey = null)
+    private List<SearchHit> SearchCore(IReadOnlyList<MemoryNamespace> namespaces, string ftsQuery, int limit, string? type = null, string? topicKey = null, string state = MemoryStates.Active)
     {
         var list = new List<SearchHit>();
         // Hard guarantee for every caller, including the trigram fallback: an FTS5
@@ -708,7 +790,7 @@ public sealed class HanniGramStore : IDisposable
         // between scopes; ORDER BY (rank, id) is deterministic and LIMIT bounds
         // the merged result set.
         var sql = @"
-            SELECT o.id, o.title, o.content, o.topic_key, o.type, o.created_at_utc, bm25(observations_fts) AS rank, o.project_id
+            SELECT o.id, o.title, o.content, o.topic_key, o.type, o.created_at_utc, bm25(observations_fts) AS rank, o.project_id, o.state
             FROM observations_fts
             JOIN observations o ON o.id = observations_fts.rowid
             WHERE observations_fts MATCH $q AND o.project_id IN (";
@@ -716,12 +798,14 @@ public sealed class HanniGramStore : IDisposable
         sql += ")";
         if (type is not null) sql += " AND o.type = $ty";
         if (topicKey is not null) sql += " AND o.topic_key = $tk";
+        if (!MemoryStates.IsAll(state)) sql += " AND o.state = $st";
         sql += "\n            ORDER BY rank, o.id\n            LIMIT $l;";
         cmd.CommandText = sql;
         cmd.Parameters.AddWithValue("$q", ftsQuery);
         for (var i = 0; i < ids.Length; i++) cmd.Parameters.AddWithValue("$p" + i, ids[i]);
         if (type is not null) cmd.Parameters.AddWithValue("$ty", type);
         if (topicKey is not null) cmd.Parameters.AddWithValue("$tk", topicKey);
+        if (!MemoryStates.IsAll(state)) cmd.Parameters.AddWithValue("$st", state);
         cmd.Parameters.AddWithValue("$l", limit);
         using var r = cmd.ExecuteReader();
         while (r.Read())
@@ -737,9 +821,85 @@ public sealed class HanniGramStore : IDisposable
                 CreatedAtUtc = DateTime.Parse(r.GetString(5), null, System.Globalization.DateTimeStyles.RoundtripKind),
                 Rank = r.IsDBNull(6) ? 0 : r.GetDouble(6),
                 Scope = scopeById.TryGetValue(projectId, out var scope) ? scope : MemoryScopes.Project,
+                State = r.IsDBNull(8) ? null : r.GetString(8),
             });
         }
         return list;
+    }
+
+    /// <summary>
+    /// Change an observation's lifecycle state by id. Scoped to
+    /// <paramref name="projectId"/>, so a caller cannot reach into another
+    /// project's (or the global) namespace by id. Returns the updated row, or null
+    /// when the id is unknown in that namespace or the state is not a known state.
+    /// The recency stamp is deliberately NOT moved: state and pin are metadata, not
+    /// a content edit, so they must not reshuffle a listing.
+    /// </summary>
+    public Observation? SetObservationState(long projectId, long id, string state)
+    {
+        lock (_gate)
+        {
+            var resolved = state?.Trim().ToLowerInvariant();
+            if (!MemoryStates.IsKnownState(resolved)) return null;
+
+            // Derive the origin label before the transaction: it needs its own command
+            // and a command may not run beside an open transaction.
+            var scope = ScopeOfProject(projectId);
+            using var tx = _conn.BeginTransaction();
+            if (ReadObservationById(projectId, id, tx) is null)
+            {
+                tx.Commit();
+                return null;
+            }
+
+            using (var cmd = CreateCommand(tx))
+            {
+                cmd.CommandText = "UPDATE observations SET state = $s WHERE id = $id AND project_id = $p";
+                cmd.Parameters.AddWithValue("$s", resolved!);
+                cmd.Parameters.AddWithValue("$id", id);
+                cmd.Parameters.AddWithValue("$p", projectId);
+                cmd.ExecuteNonQuery();
+            }
+
+            var updated = ReadObservationById(projectId, id, tx)!;
+            tx.Commit();
+            updated.Scope = scope;
+            return updated;
+        }
+    }
+
+    /// <summary>
+    /// Pin or unpin an observation by id, scoped to <paramref name="projectId"/>.
+    /// Pinning is the hook the global injection budget uses: only pinned global
+    /// heuristics are eligible for the automatic context path. Returns the updated
+    /// row, or null when the id is unknown in that namespace.
+    /// </summary>
+    public Observation? SetObservationPinned(long projectId, long id, bool pinned)
+    {
+        lock (_gate)
+        {
+            var scope = ScopeOfProject(projectId);
+            using var tx = _conn.BeginTransaction();
+            if (ReadObservationById(projectId, id, tx) is null)
+            {
+                tx.Commit();
+                return null;
+            }
+
+            using (var cmd = CreateCommand(tx))
+            {
+                cmd.CommandText = "UPDATE observations SET pinned = $pin WHERE id = $id AND project_id = $p";
+                cmd.Parameters.AddWithValue("$pin", pinned ? 1 : 0);
+                cmd.Parameters.AddWithValue("$id", id);
+                cmd.Parameters.AddWithValue("$p", projectId);
+                cmd.ExecuteNonQuery();
+            }
+
+            var updated = ReadObservationById(projectId, id, tx)!;
+            tx.Commit();
+            updated.Scope = scope;
+            return updated;
+        }
     }
 
     public IReadOnlyList<string> SuggestTopicKeys(long projectId, int limit = 20)
@@ -990,6 +1150,8 @@ public sealed class HanniGramStore : IDisposable
         Type = r.IsDBNull(9) ? null : r.GetString(9),
         CreatedAtUtc = DateTime.Parse(r.GetString(10), null, System.Globalization.DateTimeStyles.RoundtripKind),
         UpdatedAtUtc = DateTime.Parse(r.GetString(11), null, System.Globalization.DateTimeStyles.RoundtripKind),
+        State = r.GetString(12),
+        Pinned = r.GetInt64(13) != 0,
     };
 
     public void Dispose() => _conn.Dispose();
