@@ -34,7 +34,10 @@ public sealed class HanniGramStore : IDisposable
     // Bump when the FTS tokenizer or an indexed schema changes, to force a one-off
     // re-index. Do NOT bump on every open — that re-indexed the whole corpus per start.
     // v2: observations_fts gained what/why/where_/learned.
-    private const int SchemaVersion = 2;
+    // v3: sessions gain a unique (project_id, session_id) index, so a session
+    //     summary re-saved for the same session updates one row instead of
+    //     accumulating duplicates. The v3 migration deduplicates first.
+    private const int SchemaVersion = 3;
 
     private void Initialize()
     {
@@ -101,6 +104,7 @@ public sealed class HanniGramStore : IDisposable
             CreateFtsTable();
             CreateFtsSyncTriggers();
             RebuildFts();
+            EnsureSessionsUniqueIndex();
             Exec($"PRAGMA user_version={SchemaVersion};");
         }
         else
@@ -109,6 +113,9 @@ public sealed class HanniGramStore : IDisposable
             // keeps the index in sync, and a database written by an intermediate
             // build can carry the table without them.
             CreateFtsSyncTriggers();
+            // Re-assert the sessions unique index the same way: a build that wrote
+            // SchemaVersion 3 without the index must still be repaired on open.
+            EnsureSessionsUniqueIndex();
         }
     }
 
@@ -152,6 +159,62 @@ public sealed class HanniGramStore : IDisposable
         DROP TRIGGER IF EXISTS observations_fts_ai;
         DROP TRIGGER IF EXISTS observations_fts_ad;
         DROP TRIGGER IF EXISTS observations_fts_au;
+    ");
+
+    // =====================================================================
+    // Sessions schema
+    // =====================================================================
+
+    // A session is identified by (project, session_id). Without uniqueness,
+    // StartSession always INSERTed and EndSession UPDATEd every matching row, so
+    // mem_session_summary (start + end) duplicated rows and then overwrote its own
+    // summaries. The index is what makes both operations target exactly one row.
+    private const string SessionsUniqueIndexName = "uq_sessions_project_session";
+
+    /// <summary>
+    /// Ensure the unique (project_id, session_id) index exists. On an existing
+    /// database this is the migration step and it must be safe: the user's db may
+    /// already carry duplicates from the pre-v3 write path, and CREATE UNIQUE INDEX
+    /// fails outright on duplicate keys. Deduplicate first, then create.
+    /// Idempotent: once the index exists this is a cheap existence check.
+    /// </summary>
+    private void EnsureSessionsUniqueIndex()
+    {
+        if (SessionsUniqueIndexExists()) return;
+
+        DeduplicateSessions();
+        Exec($"CREATE UNIQUE INDEX IF NOT EXISTS {SessionsUniqueIndexName} ON sessions(project_id, session_id);");
+    }
+
+    private bool SessionsUniqueIndexExists()
+    {
+        using var cmd = CreateCommand();
+        cmd.CommandText = "SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = $n";
+        cmd.Parameters.AddWithValue("$n", SessionsUniqueIndexName);
+        return cmd.ExecuteScalar() is not null;
+    }
+
+    /// <summary>
+    /// Collapse duplicate (project_id, session_id) groups to a single row, keeping
+    /// the most relevant one: a row carrying a summary first, then the latest
+    /// started_at_utc, then the highest id (the most recently inserted). The rest
+    /// are removed. Runs only when the unique index is being created.
+    /// </summary>
+    private void DeduplicateSessions() => Exec(@"
+        DELETE FROM sessions
+        WHERE id NOT IN (
+            SELECT keep_id FROM (
+                SELECT id AS keep_id,
+                       ROW_NUMBER() OVER (
+                           PARTITION BY project_id, session_id
+                           ORDER BY (COALESCE(summary, '') <> '') DESC,
+                                    started_at_utc DESC,
+                                    id DESC
+                       ) AS rn
+                FROM sessions
+            )
+            WHERE rn = 1
+        );
     ");
 
     private int GetUserVersion()
@@ -479,20 +542,42 @@ public sealed class HanniGramStore : IDisposable
     // Sessions
     // =====================================================================
 
+    /// <summary>
+    /// Start (or resume) a session. Idempotent on (project, session_id): starting
+    /// a session that already exists does not insert a second row and does not
+    /// throw — the existing session is returned unchanged. The INSERT ... ON
+    /// CONFLICT DO NOTHING + read-back keeps this atomic even if two processes
+    /// (daemon and CLI on the same db) race, instead of a SELECT-then-INSERT.
+    /// </summary>
     public Session StartSession(long projectId, string sessionId)
     {
         lock (_gate)
         {
             using var tx = _conn.BeginTransaction();
             using var cmd = CreateCommand(tx);
-            cmd.CommandText = "INSERT INTO sessions (project_id, session_id, started_at_utc) VALUES ($p, $s, $n); SELECT last_insert_rowid();";
+            cmd.CommandText = @"
+                INSERT INTO sessions (project_id, session_id, started_at_utc)
+                VALUES ($p, $s, $n)
+                ON CONFLICT(project_id, session_id) DO NOTHING;";
             cmd.Parameters.AddWithValue("$p", projectId);
             cmd.Parameters.AddWithValue("$s", sessionId);
             cmd.Parameters.AddWithValue("$n", Now());
-            var id = (long)cmd.ExecuteScalar()!;
+            cmd.ExecuteNonQuery();
+
+            var session = ReadSessionByKey(projectId, sessionId, tx)!;
             tx.Commit();
-            return new Session { Id = id, ProjectId = projectId, SessionId = sessionId, StartedAtUtc = DateTime.UtcNow };
+            return session;
         }
+    }
+
+    private Session? ReadSessionByKey(long projectId, string sessionId, SqliteTransaction? transaction)
+    {
+        using var cmd = CreateCommand(transaction);
+        cmd.CommandText = "SELECT id, project_id, session_id, started_at_utc, ended_at_utc, summary, goal, next_steps FROM sessions WHERE project_id = $p AND session_id = $s";
+        cmd.Parameters.AddWithValue("$p", projectId);
+        cmd.Parameters.AddWithValue("$s", sessionId);
+        using var r = cmd.ExecuteReader();
+        return r.Read() ? ReadSession(r) : null;
     }
 
     public void EndSession(long projectId, string sessionId, string? summary, string? goal, string? nextSteps)
@@ -526,17 +611,7 @@ public sealed class HanniGramStore : IDisposable
             using var r = cmd.ExecuteReader();
             while (r.Read())
             {
-                list.Add(new Session
-                {
-                    Id = r.GetInt64(0),
-                    ProjectId = r.GetInt64(1),
-                    SessionId = r.GetString(2),
-                    StartedAtUtc = DateTime.Parse(r.GetString(3), null, System.Globalization.DateTimeStyles.RoundtripKind),
-                    EndedAtUtc = r.IsDBNull(4) ? null : DateTime.Parse(r.GetString(4), null, System.Globalization.DateTimeStyles.RoundtripKind),
-                    Summary = r.IsDBNull(5) ? null : r.GetString(5),
-                    Goal = r.IsDBNull(6) ? null : r.GetString(6),
-                    NextSteps = r.IsDBNull(7) ? null : r.GetString(7),
-                });
+                list.Add(ReadSession(r));
             }
             return list;
         }
@@ -640,6 +715,18 @@ public sealed class HanniGramStore : IDisposable
         RootPath = r.IsDBNull(2) ? null : r.GetString(2),
         CreatedAtUtc = DateTime.Parse(r.GetString(3), null, System.Globalization.DateTimeStyles.RoundtripKind),
         UpdatedAtUtc = DateTime.Parse(r.GetString(4), null, System.Globalization.DateTimeStyles.RoundtripKind),
+    };
+
+    private static Session ReadSession(SqliteDataReader r) => new()
+    {
+        Id = r.GetInt64(0),
+        ProjectId = r.GetInt64(1),
+        SessionId = r.GetString(2),
+        StartedAtUtc = DateTime.Parse(r.GetString(3), null, System.Globalization.DateTimeStyles.RoundtripKind),
+        EndedAtUtc = r.IsDBNull(4) ? null : DateTime.Parse(r.GetString(4), null, System.Globalization.DateTimeStyles.RoundtripKind),
+        Summary = r.IsDBNull(5) ? null : r.GetString(5),
+        Goal = r.IsDBNull(6) ? null : r.GetString(6),
+        NextSteps = r.IsDBNull(7) ? null : r.GetString(7),
     };
 
     private static Observation ReadObservation(SqliteDataReader r) => new()
