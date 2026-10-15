@@ -275,7 +275,7 @@ public sealed class ToolSurfaceTests
             """{"topicKey":"adr/timeline","limit":1000,"project":"alpha"}""")!);
 
         Assert.Equal("adr/timeline", payload["topicKey"]!.GetValue<string>());
-        // The store's by-key read has no limit of its own: the tool cap is the bound.
+        // Both the store's by-key read and this tool cap bind the timeline.
         Assert.Equal(McpLimits.MaxItems, payload["count"]!.GetValue<int>());
         Assert.Equal(McpLimits.MaxItems, payload["observations"]!.AsArray().Count);
     }

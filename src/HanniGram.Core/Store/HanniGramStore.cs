@@ -828,18 +828,25 @@ public sealed class HanniGramStore : IDisposable
     private static string ReadState(string? state) =>
         MemoryStates.IsAll(state) ? MemoryStates.All : MemoryStates.Resolve(state, MemoryStates.Active);
 
-    public IReadOnlyList<Observation> GetByTopicKey(long projectId, string topicKey)
+    /// <summary>
+    /// The full timeline for one topic key, newest first. This is the only read
+    /// that returns a key's whole history, so it carries its own hard cap instead
+    /// of trusting a caller: no in-process path can turn it into a corpus dump.
+    /// The state filter is deliberately absent — a by-key timeline is an exact,
+    /// deliberate lookup, so it shows the full history including archived rows.
+    /// </summary>
+    public IReadOnlyList<Observation> GetByTopicKey(long projectId, string topicKey, int limit = MaxTimelineItems)
     {
         lock (_gate)
         {
+            // Hard cap: a caller may ask for fewer rows, never for more.
+            limit = Math.Clamp(limit, 1, MaxTimelineItems);
             var list = new List<Observation>();
             using var cmd = CreateCommand();
-            // No state filter: a timeline by key is an exact lookup, so it shows the
-            // full history including archived rows. The default state filter applies
-            // to search and recency listing, not to a deliberate by-key read.
-            cmd.CommandText = "SELECT id, project_id, title, content, what, why, where_, learned, topic_key, type, created_at_utc, updated_at_utc, state, pinned FROM observations WHERE project_id = $p AND topic_key = $tk ORDER BY created_at_utc DESC";
+            cmd.CommandText = "SELECT id, project_id, title, content, what, why, where_, learned, topic_key, type, created_at_utc, updated_at_utc, state, pinned FROM observations WHERE project_id = $p AND topic_key = $tk ORDER BY created_at_utc DESC LIMIT $l";
             cmd.Parameters.AddWithValue("$p", projectId);
             cmd.Parameters.AddWithValue("$tk", topicKey);
+            cmd.Parameters.AddWithValue("$l", limit);
             using var r = cmd.ExecuteReader();
             while (r.Read()) list.Add(ReadObservation(r));
             return list;
@@ -1359,6 +1366,11 @@ public sealed class HanniGramStore : IDisposable
     // The hard cap on the review listing. A caller may ask for fewer; nobody can
     // ask for more, so the review response can never become a corpus dump.
     public const int MaxReviewItems = 50;
+
+    // The hard cap on a by-key timeline (GetByTopicKey). It is the only read that
+    // returns a key's whole history, so it bounds itself; a caller may ask for
+    // fewer, never more.
+    public const int MaxTimelineItems = 50;
 
     // The global injection budget. Pinned global heuristics are the ONLY global
     // memory eligible for the automatic context path, and the count is fixed here;

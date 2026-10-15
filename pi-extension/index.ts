@@ -239,10 +239,10 @@ export default function (pi: ExtensionAPI) {
 				content: [
 					{
 						type: "text",
-						text: `${created ? "Saved" : "Updated"} observation #${obs.id} (${res.scope}): ${obs.title}${obs.topicKey ? ` [topic: ${obs.topicKey}]` : ""}${hint}`,
+						text: `${created ? "Saved" : "Updated"} observation #${obs.id} (${res.scope}): ${bound(obs.title, MAX_TITLE_CHARS)}${obs.topicKey ? ` [topic: ${bound(obs.topicKey, MAX_TOKEN_CHARS)}]` : ""}${hint}`,
 					},
 				],
-				details: obs,
+				details: boundedObservation(obs),
 			};
 		},
 	});
@@ -310,9 +310,9 @@ export default function (pi: ExtensionAPI) {
 				return { content: [{ type: "text", text: "No memory matches." }], details: [] };
 			}
 			const text = hits
-				.map((h) => `#${h.id} (${h.scope ?? "project"}) ${h.title}${h.topicKey ? ` [${h.topicKey}]` : ""}\n  ${h.content}`)
+				.map((h) => `#${h.id} (${h.scope ?? "project"}) ${bound(h.title, MAX_TITLE_CHARS)}${h.topicKey ? ` [${bound(h.topicKey, MAX_TOKEN_CHARS)}]` : ""}\n  ${bound(h.content)}`)
 				.join("\n");
-			return { content: [{ type: "text", text }], details: hits };
+			return { content: [{ type: "text", text }], details: hits.map(boundedObservation) };
 		},
 	});
 
@@ -336,9 +336,9 @@ export default function (pi: ExtensionAPI) {
 				return { content: [{ type: "text", text: "No memory yet for this project." }], details: [] };
 			}
 			const text = obs
-				.map((o) => `#${o.id} ${o.title}${o.topicKey ? ` [${o.topicKey}]` : ""}\n  ${o.content}`)
+				.map((o) => `#${o.id} ${bound(o.title, MAX_TITLE_CHARS)}${o.topicKey ? ` [${bound(o.topicKey, MAX_TOKEN_CHARS)}]` : ""}\n  ${bound(o.content)}`)
 				.join("\n");
-			return { content: [{ type: "text", text }], details: obs };
+			return { content: [{ type: "text", text }], details: obs.map(boundedObservation) };
 		},
 	});
 
@@ -364,8 +364,10 @@ export default function (pi: ExtensionAPI) {
 			if (obs.length === 0) {
 				return { content: [{ type: "text", text: `No observations for topic '${params.topicKey}'.` }], details: [] };
 			}
-			const text = obs.map((o) => `#${o.id} ${o.title}\n  ${o.content}`).join("\n");
-			return { content: [{ type: "text", text }], details: obs };
+			const text = obs
+				.map((o) => `#${o.id} ${bound(o.title, MAX_TITLE_CHARS)}\n  ${bound(o.content)}`)
+				.join("\n");
+			return { content: [{ type: "text", text }], details: obs.map(boundedObservation) };
 		},
 	});
 
@@ -382,7 +384,19 @@ export default function (pi: ExtensionAPI) {
 		execute: async (_id, params, _signal, _onUpdate, ctx: ExtensionToolContext) => {
 			await ensureDaemon();
 			const obs = await api<Record<string, unknown>>(`/api/observations/${params.id}?${scope(ctx.cwd)}`);
-			return { content: [{ type: "text", text: JSON.stringify(obs, null, 2) }], details: obs };
+			const bounded = boundedObservation(obs);
+			// Bounded rendering: the previous raw JSON.stringify could hand the model a
+			// whole 6000-character body. Every field now goes through the same budget.
+			const lines = [`#${bounded.id} ${bound(bounded.title, MAX_TITLE_CHARS)}`];
+			if (bounded.topicKey) lines.push(`topic: ${bound(bounded.topicKey, MAX_TOKEN_CHARS)}`);
+			if (bounded.type) lines.push(`type: ${bound(bounded.type, MAX_TOKEN_CHARS)}`);
+			if (bounded.state) lines.push(`state: ${bounded.state}`);
+			lines.push(bound(bounded.content));
+			for (const field of CONTENT_FIELDS) {
+				if (field === "content") continue;
+				if (bounded[field]) lines.push(`${field}: ${bound(bounded[field])}`);
+			}
+			return { content: [{ type: "text", text: lines.join("\n") }], details: bounded };
 		},
 	});
 
@@ -477,7 +491,7 @@ export default function (pi: ExtensionAPI) {
 				return { content: [{ type: "text", text: `Observation #${id} not found.` }], details: { updated: false } };
 			}
 			ctx.ui.notify(`✎ Memoria actualizada #${obs.id}: ${obs.title}`, "info");
-			return { content: [{ type: "text", text: `Updated observation #${obs.id}: ${obs.title}` }], details: obs };
+			return { content: [{ type: "text", text: `Updated observation #${obs.id}: ${bound(obs.title, MAX_TITLE_CHARS)}` }], details: boundedObservation(obs) };
 		},
 	});
 
@@ -605,7 +619,7 @@ export default function (pi: ExtensionAPI) {
 				return { content: [{ type: "text", text: `Observation #${params.id} not found.` }], details: { updated: false } };
 			}
 			ctx.ui.notify(`✓ Memoria #${obs.id} → ${obs.state}`, "info");
-			return { content: [{ type: "text", text: `Observation #${obs.id} state: ${obs.state}` }], details: obs };
+			return { content: [{ type: "text", text: `Observation #${obs.id} state: ${obs.state}` }], details: boundedObservation(obs) };
 		},
 	});
 
@@ -635,7 +649,7 @@ export default function (pi: ExtensionAPI) {
 				return { content: [{ type: "text", text: `Observation #${params.id} not found.` }], details: { updated: false } };
 			}
 			ctx.ui.notify(`✓ Memoria #${obs.id} pinned=${obs.pinned}`, "info");
-			return { content: [{ type: "text", text: `Observation #${obs.id} pinned: ${obs.pinned}` }], details: obs };
+			return { content: [{ type: "text", text: `Observation #${obs.id} pinned: ${obs.pinned}` }], details: boundedObservation(obs) };
 		},
 	});
 }

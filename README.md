@@ -124,7 +124,7 @@ Tools: `mem_current_project`, `mem_save`, `mem_search`, `mem_context`, `mem_time
 
 `mem_save` acepta `scope=project|global` y `mem_search` acepta `scope=project|global|all` (cada acierto llega etiquetado con su origen); `mem_update`, `mem_state`, `mem_pin` y `mem_delete` aceptan `scope` para elegir a qué ámbito pertenece la fila (así `mem_delete` alcanza la memoria global). `mem_promote` acepta `allowArchived`: una fuente `archived` se rechaza por defecto y el rechazo llega como resultado (`outcome=refused`, `reason=source_archived`), no como error.
 
-Todas las tools son **bajo demanda**: la extensión no inyecta memoria en el prompt por sí sola ni inyecta texto completo de una observación.
+Todas las tools son **bajo demanda**: la extensión no inyecta memoria en el prompt por sí sola ni inyecta texto completo de una observación. Toda lectura orientada al modelo (`mem_get_observation`, `mem_search`, `mem_timeline`, `mem_update`, `mem_promote`, `mem_state`, `mem_pin`) acota cada campo de texto (2000 caracteres, con `…`) tanto en el texto renderizado como en el payload de `details`, igual que los caps del servidor MCP; `mem_timeline` además se limita a un máximo de 50 filas por clave.
 
 ```bash
 cd pi-extension && npm install   # typebox + jiti (para el script de verificación)

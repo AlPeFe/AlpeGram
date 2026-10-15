@@ -204,9 +204,9 @@ public sealed class MemoryToolInvoker
         var array = new JsonArray();
         if (projectId is not null)
         {
-            // GetByTopicKey returns the full history for a key with no limit of its
-            // own: the tool cap is what bounds this response.
-            foreach (var observation in Bounded.Cap(_store.GetByTopicKey(projectId.Value, topicKey), limit))
+            // GetByTopicKey has its own hard cap; passing the tool limit keeps the
+            // SQL LIMIT at the source and the Cap is the belt-and-braces bound.
+            foreach (var observation in Bounded.Cap(_store.GetByTopicKey(projectId.Value, topicKey, limit), limit))
             {
                 array.Add(ObservationNode(observation, scope));
             }

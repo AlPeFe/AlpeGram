@@ -204,3 +204,28 @@ assert(
 	"mem_timeline broke for a plain topic key",
 );
 
+// F3 — a 6000-character body must not reach the model intact: every field is bound
+// (matching the MCP caps) and truncation is marked with an ellipsis.
+const longBody = `zephyrlongmarker ${"x".repeat(6000)}`;
+const longSaved = await run("mem_save", {
+	title: "Long body regression",
+	content: longBody,
+	topicKey: "verification/long-body",
+});
+const longFetched = await run("mem_get_observation", { id: longSaved.details?.id });
+const fetchedText = longFetched.content?.[0]?.text ?? "";
+assert(
+	fetchedText.length <= 2500,
+	`mem_get_observation returned ${fetchedText.length} characters; the model-facing body must be bounded`,
+);
+assert(fetchedText.includes("\u2026"), "mem_get_observation did not mark the truncated body with an ellipsis");
+assert(
+	(longFetched.details?.content?.length ?? 0) <= 2001,
+	"the bounded details payload still carried an unbounded body",
+);
+const longSearched = await run("mem_search", { query: "zephyrlongmarker" });
+assert(
+	(longSearched.details?.[0]?.content?.length ?? 0) <= 2001,
+	"mem_search handed the model an unbounded body",
+);
+
