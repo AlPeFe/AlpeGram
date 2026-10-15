@@ -63,7 +63,7 @@ dotnet run -c Release
 | GET | `/api/observations?cwd=&limit=&scope=&state=` | Observaciones recientes (solo `active` por defecto) |
 | GET | `/api/observations/topic?topicKey=&cwd=` | Observaciones por topic key (historial completo); forma canónica con `topicKey` como query param, para que las claves con `/` (`svc/auth`) sobrevivan el URL-encoding. Se mantiene `/api/observations/topic/{key}` para claves planas y rutas con `/` (catch-all) |
 | PUT | `/api/observations/{id}?cwd=&scope=` | Actualizar una observación por id (mem_update); los campos nulos no cambian |
-| DELETE | `/api/observations/{id}?cwd=` | Borrar una observación (escopada al proyecto) |
+| DELETE | `/api/observations/{id}?cwd=&scope=project\|global` | Borrar una observación (por defecto en el proyecto; `scope=global` alcanza la memoria compartida) |
 | POST | `/api/observations/{id}/state?cwd=&scope=` | Cambiar el estado (`active`/`needs_review`/`archived`) |
 | POST | `/api/observations/{id}/pin?cwd=&scope=` | Fijar o quitar el pin de una observación |
 | POST | `/api/observations/{id}/promote?cwd=&allowArchived=` | Promover una observación al ámbito global; una fuente `archived` se rechaza con 409 salvo `allowArchived=true` |

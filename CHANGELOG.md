@@ -7,6 +7,37 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+### Added
+
+- **`allowArchived` on promotion.** `mem_promote` and
+  `POST /api/observations/{id}/promote` accept `allowArchived=true` as the explicit
+  opt-in to promote a retired (`archived`) row.
+
+### Changed
+
+- **Promotion never destroys live global truth with retired content.** Promoting an
+  `archived` row is now refused by default (`outcome=refused`,
+  `reason=source_archived`): the HTTP route answers `409 Conflict` and the MCP tool
+  returns an `isError` result the model can act on. With `allowArchived=true` the
+  promotion proceeds, but the surviving global row adopts the source's lifecycle
+  state, so retired content lands `archived` instead of silently becoming active. A
+  live teaching still revives an archived target to the source's state.
+- **Slash topic keys are retrievable over HTTP.** The canonical by-key lookup is now
+  the query form `GET /api/observations/topic?topicKey=svc/auth`; the path form is
+  kept for plain keys and as a catch-all route, and a still-encoded `%2F` is decoded,
+  so keys like `architecture/auth-model` no longer come back as a silent empty list.
+- **`mem_delete` reaches global memory.** The extension's `mem_delete` accepts
+  `scope`, and the server DELETE route resolves `scope=global` read-only (a miss
+  never materialises the sentinel).
+
+### Fixed
+
+- **Bounded model-facing reads in the Pi extension.** `mem_get_observation`,
+  `mem_search` and `mem_timeline` (and the other read tools) now cap every text
+  field at 2000 characters with an explicit `…`, and bound the structured `details`
+  payloads to match the MCP server caps; `mem_timeline` is also hard-capped at 50
+  rows per key. Previously a single 6000-character body reached the model intact.
+
 ## [0.2.0] - 2026-10-15
 
 Hardening of the memory engine plus the features the product actually needed:

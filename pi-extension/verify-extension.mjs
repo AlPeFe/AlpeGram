@@ -229,3 +229,22 @@ assert(
 	"mem_search handed the model an unbounded body",
 );
 
+// F4 — mem_delete must reach a global memory with scope='global'.
+const globalToDelete = await run("mem_save", {
+	title: "Global delete regression",
+	content: "larchdeletable marker in the shared global scope",
+	topicKey: "verification/global-delete",
+	scope: "global",
+});
+const deleteResult = await run("mem_delete", { id: globalToDelete.details?.id, scope: "global" });
+assert(
+	deleteResult.details?.deleted === true,
+	"mem_delete with scope='global' did not delete the global memory",
+);
+const stillThere = await run("mem_search", { query: "larchdeletable", scope: "global" }, otherProject);
+assert(
+	(stillThere.details?.length ?? 0) === 0,
+	"the global memory was reported deleted but is still searchable",
+);
+
+console.log("\nALL TOOLS EXECUTED OK");

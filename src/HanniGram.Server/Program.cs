@@ -155,8 +155,13 @@ app.MapGet("/api/observations/{id:long}", (long id, HttpRequest req) =>
 
 app.MapDelete("/api/observations/{id:long}", (long id, HttpRequest req) =>
 {
-    var p = ResolveProject(req);
-    var deleted = store.DeleteObservation(p.Id, id);
+    // A delete may target the caller's project (default) or the shared global
+    // namespace via ?scope=global. The global namespace is resolved read-only, so
+    // a delete never materialises the sentinel just to report a miss.
+    var scope = MemoryScopes.ResolveScope(req.Query["scope"].FirstOrDefault(), MemoryScopes.Project);
+    var projectId = scope == MemoryScopes.Global ? store.GetGlobalProject()?.Id : ResolveProject(req).Id;
+    if (projectId is null) return Results.NotFound();
+    var deleted = store.DeleteObservation(projectId.Value, id);
     return deleted ? Results.Ok(new { deleted = true, id }) : Results.NotFound();
 });
 

@@ -254,25 +254,28 @@ export default function (pi: ExtensionAPI) {
 		name: "mem_delete",
 		label: "HanniGram: delete memory",
 		description:
-			"Delete a memory observation by id from the current project. Use to remove stale, wrong, or superseded observations. Returns whether it was deleted.",
+			"Delete a memory observation by id from the current project (or the shared global memory with scope='global'). Use to remove stale, wrong, or superseded observations. Returns whether it was deleted.",
 		parameters: Type.Object({
 			id: Type.Number({ description: "Observation id to delete" }),
+			scope: Type.Optional(
+				Type.String({ description: "Namespace that owns the row: 'project' (default) or 'global'." }),
+			),
 		}),
 		execute: async (_id, params, _signal, _onUpdate, ctx: ExtensionToolContext) => {
 			await ensureDaemon();
-			const res = await fetch(`${baseUrl()}/api/observations/${params.id}?${scope(ctx.cwd)}`, {
-				method: "DELETE",
-			});
+			const { id, scope: rowScope } = params;
+			const url = `${baseUrl()}/api/observations/${id}?${scope(ctx.cwd, rowScope ? { scope: rowScope } : {})}`;
+			const res = await fetch(url, { method: "DELETE" });
 			if (res.status === 404) {
-				ctx.ui.notify(`✗ Memoria #${params.id} no encontrada`, "warning");
-				return { content: [{ type: "text", text: `Observation #${params.id} not found.` }], details: { deleted: false } };
+				ctx.ui.notify(`✗ Memoria #${id} no encontrada`, "warning");
+				return { content: [{ type: "text", text: `Observation #${id} not found.` }], details: { deleted: false } };
 			}
 			if (!res.ok) {
 				const body = await res.text().catch(() => "");
 				throw new Error(`HanniGram ${res.status}: ${body || res.statusText}`);
 			}
-			ctx.ui.notify(`✓ Memoria eliminada #${params.id}`, "info");
-			return { content: [{ type: "text", text: `Deleted observation #${params.id}.` }], details: { deleted: true, id: params.id } };
+			ctx.ui.notify(`✓ Memoria eliminada #${id}`, "info");
+			return { content: [{ type: "text", text: `Deleted observation #${id}.` }], details: { deleted: true, id } };
 		},
 	});
 
