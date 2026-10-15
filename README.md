@@ -36,6 +36,7 @@ SQLite + FTS5 (~/.hannigram/hannigram.db)
 | `src/HanniGram.Core` | Dominio + store SQLite/FTS5 (`HanniGramStore`) + resolver de proyecto |
 | `src/HanniGram.Server` | Daemon HTTP (ASP.NET Core minimal API) |
 | `src/HanniGram.Cli` | CLI standalone (no necesita daemon) |
+| `src/HanniGram.Mcp` | Servidor MCP por stdio (opcional, reutiliza `HanniGram.Core`; sin daemon) |
 | `pi-extension/` | Extensión nativa de Pi que registra las tools `mem_*` |
 
 ## Ejecutar el daemon
@@ -128,9 +129,33 @@ Verifica la extensión contra un daemon en ejecución:
 node --experimental-strip-types --no-warnings verify-extension.mjs
 ```
 
+## Servidor MCP por stdio (opt-in, desactivado por defecto)
+
+Además de la integración nativa con HanniPI, HanniGram trae un **servidor MCP opcional** (`src/HanniGram.Mcp`, `hannigram-mcp.exe`). Habla **JSON-RPC 2.0 por stdio** (mensajes delimitados por saltos de línea), reutiliza `HanniGram.Core` y **abre la SQLite directamente — no necesita el daemon**. Coexiste con el daemon en marcha sobre la misma BD (WAL + `busy_timeout`).
+
+**Está desconectado por defecto.** HanniGram no escribe ni modifica ningún fichero de configuración de harness (`~/.pi/agent/mcp.json`, `.pi/mcp.json`, etc.): nada se registra solo. Si quieres usarlo, **regístralo tú** en tu cliente MCP:
+
+```json
+{
+  "mcpServers": {
+    "hannigram": {
+      "command": "C:\\ruta\\a\\hannigram-mcp.exe",
+      "args": [],
+      "env": { "HANNIGRAM_DB": "C:\\Users\\<usuario>\\.hannigram\\hannigram.db" }
+    }
+  }
+}
+```
+
+- La BD sale de `HANNIGRAM_DB` (mismo valor por defecto que el daemon/CLI: `~/.hannigram/hannigram.db`).
+- El proyecto se resuelve desde el argumento `project` de cada tool, luego `HANNIGRAM_CWD`, luego el directorio de trabajo del proceso.
+- Todo **dato diagnóstico va a stderr**; stdout es solo el canal de protocolo.
+
+Tools expuestas (mismo motor que la API de memoria): `mem_current_project`, `mem_save`, `mem_search`, `mem_context`, `mem_get_observation`, `mem_timeline`, `mem_suggest_topic_key`, `mem_delete`, `mem_session_summary`, `mem_update`, `mem_review`, `mem_promote`, `mem_state`, `mem_pin`.
+
 ## Releases
 
-El binario Windows x64 (daemon + CLI self-contained, sin .NET en la máquina destino) se publica aquí como
+El binario Windows x64 (daemon + CLI + servidor MCP self-contained, sin .NET en la máquina destino) se publica aquí como
 `hannigram-windows-x64.zip` y es la **fuente de verdad** del motor:
 
 ```bash
@@ -140,7 +165,7 @@ git tag v0.1.0 && git push origin v0.1.0     # dispara .github/workflows/release
 El workflow (Windows) publica el exe, hace smoke test de `/health`, empaqueta con `scripts/pack-asset.ps1`
 y crea la release con `hannigram-windows-x64.zip`, `SHA256SUMS` y `VERSION.txt` (tag, commit, fecha).
 
-El asset incluye `pi-extension/`, así que quien lo instala obtiene daemon + CLI + tools `mem_*` de una vez.
+El asset incluye `pi-extension/` (y el `hannigram-mcp.exe` opt-in), así que quien lo instala obtiene daemon + CLI + server MCP + tools `mem_*` de una vez.
 HanniPI copia este mismo asset **pinneado** en su release (ver `HanniPI/.pi/skills/release.md`) para que
 instalar HanniPI+memoria sea una sola descarga; `hanni-setup.ps1 -Hannigram latest` trae la última de aquí.
 
