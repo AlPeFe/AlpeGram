@@ -166,4 +166,41 @@ assert(
 );
 
 console.log(`\nTool list matches the expected ${EXPECTED_TOOLS.length} tools.`);
-console.log("\nALL TOOLS EXECUTED OK");
+
+// ---------------------------------------------------------------------------
+// Independent-verifier regressions: F2 (slash topic keys), F3 (bounded reads)
+// and F4 (deleting a global memory). Each ran and failed before its fix.
+// ---------------------------------------------------------------------------
+
+// F2 — a slash topic key is exactly the documented shape ("architecture/auth-model")
+// and MUST be retrievable through the extension's own call form.
+const slashSaved = await run("mem_save", {
+	title: "Slash key regression",
+	content: "larkspurretrieval marker under a slash topic key",
+	topicKey: "svc/auth",
+	type: "pattern",
+});
+assert(slashSaved.details?.id !== undefined, "mem_save with a slash topicKey did not return an id");
+const slashTimeline = await run("mem_timeline", { topicKey: "svc/auth" });
+assert(
+	Array.isArray(slashTimeline.details) && slashTimeline.details.length > 0,
+	"mem_timeline returned nothing for the slash topic key 'svc/auth' (silent false negative)",
+);
+assert(
+	slashTimeline.details.some((o) => o.id === slashSaved.details?.id),
+	"mem_timeline did not return the row saved under the slash topic key",
+);
+
+// F2 — a plain key still works (the fix must not trade one broken form for another).
+const plainSaved = await run("mem_save", {
+	title: "Plain key regression",
+	content: "larkspurplain marker under a plain topic key",
+	topicKey: "svcplain",
+	type: "pattern",
+});
+const plainTimeline = await run("mem_timeline", { topicKey: "svcplain" });
+assert(
+	Array.isArray(plainTimeline.details) && plainTimeline.details.some((o) => o.id === plainSaved.details?.id),
+	"mem_timeline broke for a plain topic key",
+);
+

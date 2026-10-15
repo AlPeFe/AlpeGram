@@ -209,11 +209,28 @@ app.MapGet("/api/context", (HttpRequest req) =>
     return Results.Json(store.GetContextSurface(p.Id), json);
 });
 
-app.MapGet("/api/observations/topic/{topicKey}", (string topicKey, HttpRequest req) =>
+// Topic-key lookup. Slash keys ("architecture/auth-model", "adr/<slug>") are the
+// documented shape, so the canonical form is a QUERY parameter: `?topicKey=svc/auth`
+// survives URL-encoding exactly and cannot silently mismatch. A path form is kept
+// for plain keys and for a raw slash path (catch-all); a still-percent-encoded
+// `%2F` is decoded here, so the earlier `encodeURIComponent` callers stop getting
+// a silent empty list.
+IResult TopicTimeline(HttpRequest req, string topicKey)
 {
     var p = ResolveProject(req);
     return Results.Json(store.GetByTopicKey(p.Id, topicKey), json);
+}
+
+app.MapGet("/api/observations/topic", (HttpRequest req) =>
+{
+    var topicKey = req.Query["topicKey"].FirstOrDefault();
+    if (string.IsNullOrEmpty(topicKey))
+        return Results.BadRequest(new { error = "topicKey_required" });
+    return TopicTimeline(req, topicKey);
 });
+
+app.MapGet("/api/observations/topic/{**topicKey}", (string topicKey, HttpRequest req) =>
+    TopicTimeline(req, Uri.UnescapeDataString(topicKey)));
 
 // ---- Search (FTS5) ----
 app.MapGet("/api/search", (HttpRequest req, string q, int limit = 10, string? type = null, string? topicKey = null, string? scope = null, string? state = null) =>

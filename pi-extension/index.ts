@@ -355,8 +355,11 @@ export default function (pi: ExtensionAPI) {
 		}),
 		execute: async (_id, params, _signal, _onUpdate, ctx: ExtensionToolContext) => {
 			await ensureDaemon();
+			// The canonical by-key lookup is a QUERY parameter: a slash key
+			// ("architecture/auth-model") survives URL-encoding exactly, unlike a path
+			// segment, which used to come back as a silent empty list.
 			const obs = await api<Array<{ id: number; title: string; content: string; topicKey?: string }>>(
-				`/api/observations/topic/${encodeURIComponent(params.topicKey)}?${scope(ctx.cwd)}`,
+				`/api/observations/topic?${scope(ctx.cwd, { topicKey: params.topicKey })}`,
 			);
 			if (obs.length === 0) {
 				return { content: [{ type: "text", text: `No observations for topic '${params.topicKey}'.` }], details: [] };

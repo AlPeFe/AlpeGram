@@ -61,7 +61,7 @@ dotnet run -c Release
 | POST | `/api/observations?cwd=&scope=` | Guardar una observación (upsert por `topic_key`); devuelve un `review` compacto si hubo colisión |
 | GET | `/api/observations/{id}?cwd=` | Obtener una observación (escopada al proyecto) |
 | GET | `/api/observations?cwd=&limit=&scope=&state=` | Observaciones recientes (solo `active` por defecto) |
-| GET | `/api/observations/topic/{key}?cwd=` | Observaciones por topic key (historial completo) |
+| GET | `/api/observations/topic?topicKey=&cwd=` | Observaciones por topic key (historial completo); forma canónica con `topicKey` como query param, para que las claves con `/` (`svc/auth`) sobrevivan el URL-encoding. Se mantiene `/api/observations/topic/{key}` para claves planas y rutas con `/` (catch-all) |
 | PUT | `/api/observations/{id}?cwd=&scope=` | Actualizar una observación por id (mem_update); los campos nulos no cambian |
 | DELETE | `/api/observations/{id}?cwd=` | Borrar una observación (escopada al proyecto) |
 | POST | `/api/observations/{id}/state?cwd=&scope=` | Cambiar el estado (`active`/`needs_review`/`archived`) |
