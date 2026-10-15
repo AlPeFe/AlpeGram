@@ -91,3 +91,19 @@ public sealed class SearchHit
 /// label ("project" or "global") stamped onto every row it returns.
 /// </summary>
 public readonly record struct MemoryNamespace(long ProjectId, string Scope);
+
+/// <summary>
+/// The compact review hint a save returns when it detected a collision. A few
+/// tokens only: the colliding id, its truncated title and the kind of collision.
+/// It is absent (null) when there is nothing to report. This is the entire
+/// review mechanism on the hot path — it never carries memory bodies.
+/// </summary>
+public sealed class SaveReviewHint
+{
+    /// <summary>"topic_key" (an upsert overwrote an existing keyed row) or "duplicate".</summary>
+    public required string Kind { get; set; }
+    /// <summary>The id of the row the save collided with.</summary>
+    public long Id { get; set; }
+    /// <summary>The colliding row's title, truncated to a few dozen characters.</summary>
+    public required string Title { get; set; }
+}

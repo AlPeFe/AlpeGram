@@ -92,11 +92,13 @@ app.MapPost("/api/observations", (HttpRequest req, ObservationBody body) =>
         ? store.GetOrCreateGlobalProject().Id
         : ResolveProject(req).Id;
 
-    var (obs, created) = store.SaveObservation(
+    var (obs, created, review) = store.SaveObservationWithReview(
         projectId, body.Title, body.Content ?? "",
         body.What, body.Why, body.Where, body.Learned, body.TopicKey, body.Type);
     obs.Scope = scope;
-    return Results.Json(new { observation = obs, created, scope }, json);
+    // `review` is the compact deterministic hint (a few tokens) or null when
+    // nothing collided. It is the entire review mechanism on the save hot path.
+    return Results.Json(new { observation = obs, created, scope, review }, json);
 });
 
 app.MapGet("/api/observations/{id:long}", (long id, HttpRequest req) =>

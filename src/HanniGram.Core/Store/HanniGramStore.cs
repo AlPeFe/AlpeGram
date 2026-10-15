@@ -401,12 +401,40 @@ public sealed class HanniGramStore : IDisposable
         string? what = null, string? why = null, string? where = null, string? learned = null,
         string? topicKey = null, string? type = null)
     {
+        var result = SaveObservationWithReview(projectId, title, content, what, why, where, learned, topicKey, type);
+        return (result.Observation, result.Created);
+    }
+
+    /// <summary>
+    /// Save, and additionally report the deterministic review hint (T14). The hint
+    /// is compact and absent when nothing collided. Detection is server-side and
+    /// bounded: a keyed save already read its exact <c>topic_key</c> match through
+    /// the upsert lookup, and an unkeyed save is compared against a bounded recent
+    /// window in the same namespace — never the whole corpus, never an LLM.
+    /// </summary>
+    public (Observation Observation, bool Created, SaveReviewHint? Review) SaveObservationWithReview(
+        long projectId, string title, string content,
+        string? what = null, string? why = null, string? where = null, string? learned = null,
+        string? topicKey = null, string? type = null)
+    {
         lock (_gate)
         {
             using var tx = _conn.BeginTransaction();
-            var existing = string.IsNullOrEmpty(topicKey) ? null : FindLatestByTopicKey(projectId, topicKey, tx);
+            var keyed = !string.IsNullOrEmpty(topicKey);
+            var existing = keyed ? FindLatestByTopicKey(projectId, topicKey!, tx) : null;
             long id;
             var created = existing is null;
+
+            // The duplicate probe runs BEFORE the insert and only for an unkeyed,
+            // brand-new row: an unkeyed save is the case that can silently duplicate
+            // an existing memory. Comparing against the window before the write keeps
+            // the new row out of its own candidate set.
+            SaveReviewHint? review = null;
+            if (created && !keyed)
+            {
+                review = FindNearDuplicateHint(projectId, title, content, tx);
+            }
+
             if (created)
             {
                 using var cmd = CreateCommand(tx);
@@ -444,6 +472,16 @@ public sealed class HanniGramStore : IDisposable
                 cmd.Parameters.AddWithValue("$n", Now());
                 cmd.Parameters.AddWithValue("$id", id);
                 cmd.ExecuteNonQuery();
+
+                // The upsert path overwrote a keyed row: that is precisely the
+                // "current truth replaced older truth" event worth a nudge, and it
+                // is the only hint the hot path needs.
+                review = new SaveReviewHint
+                {
+                    Kind = "topic_key",
+                    Id = existing.Id,
+                    Title = Preview(existing.Title, TitlePreviewChars),
+                };
             }
             // Read back on the same transaction rather than through the public
             // GetObservation: that method would be correct too (it opens no
@@ -451,8 +489,44 @@ public sealed class HanniGramStore : IDisposable
             // keeps the readback on the connection's active transaction.
             var observation = ReadObservationById(projectId, id, tx)!;
             tx.Commit();
-            return (observation, created);
+            return (observation, created, review);
         }
+    }
+
+    /// <summary>
+    /// Compare an unkeyed save against the bounded recent window in the same
+    /// namespace and return the strongest near-duplicate, or null. The window and
+    /// the similarity rule are constants on <see cref="MemoryDedup"/>.
+    /// </summary>
+    private SaveReviewHint? FindNearDuplicateHint(
+        long projectId, string title, string content, SqliteTransaction tx)
+    {
+        var signature = MemoryDedup.Signature(title, content);
+        if (signature.Count < MemoryDedup.MinSignatureTokens) return null;
+
+        using var cmd = CreateCommand(tx);
+        cmd.CommandText = "SELECT id, title, content FROM observations WHERE project_id = $p AND state <> $archived ORDER BY updated_at_utc DESC, id DESC LIMIT $w";
+        cmd.Parameters.AddWithValue("$p", projectId);
+        cmd.Parameters.AddWithValue("$archived", MemoryStates.Archived);
+        cmd.Parameters.AddWithValue("$w", MemoryDedup.WindowSize);
+        using var r = cmd.ExecuteReader();
+        while (r.Read())
+        {
+            var candidateId = r.GetInt64(0);
+            var candidateTitle = r.GetString(1);
+            var candidateContent = r.GetString(2);
+            var similarity = MemoryDedup.Dice(signature, MemoryDedup.Signature(candidateTitle, candidateContent));
+            if (similarity >= MemoryDedup.NearDuplicateThreshold)
+            {
+                return new SaveReviewHint
+                {
+                    Kind = "duplicate",
+                    Id = candidateId,
+                    Title = Preview(candidateTitle, TitlePreviewChars),
+                };
+            }
+        }
+        return null;
     }
 
     private Observation? FindLatestByTopicKey(long projectId, string topicKey, SqliteTransaction? transaction)
@@ -1007,6 +1081,25 @@ public sealed class HanniGramStore : IDisposable
     private const int MaxLimit = 500;
 
     private static int ClampLimit(int limit) => Math.Clamp(limit, 1, MaxLimit);
+
+    // =====================================================================
+    // Bounded surfaces (review / automatic context)
+    // =====================================================================
+
+    // Preview bounds. Every review row and every context row is truncated: the body
+    // never leaves the store on a bounded surface.
+    private const int TitlePreviewChars = 80;
+
+    /// <summary>
+    /// Collapse whitespace and truncate to <paramref name="max"/> characters with a
+    /// trailing ellipsis. Used by every bounded surface so it never returns a body.
+    /// </summary>
+    private static string Preview(string? text, int max)
+    {
+        if (string.IsNullOrWhiteSpace(text)) return string.Empty;
+        var collapsed = string.Join(' ', text.Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries));
+        return collapsed.Length <= max ? collapsed : collapsed[..max] + "…";
+    }
 
     /// <summary>
     /// Rebuild the FTS index from the content table. FTS5 EXTERNAL-CONTENT tables
