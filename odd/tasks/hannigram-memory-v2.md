@@ -186,9 +186,9 @@ extension stays the primary zero-config path.
 
 ### Slice 4 — MCP and portability
 
-- [ ] **T16** stdio MCP server reusing `HanniGram.Core` directly (no daemon dependency),
+- [x] **T16** stdio MCP server reusing `HanniGram.Core` directly (no daemon dependency),
       mirroring the `mem_*` tool surface. Must coexist with the daemon via the existing
-      WAL + `busy_timeout` design.
+      WAL + `busy_timeout` design. (see Slice 4 in the Log)
 
 ### Slice 5 — integration and docs
 
@@ -573,4 +573,110 @@ The **T21 contract** (the hard budget on automatic injection):
 - **The whole slice was reconstructed task-by-task forward from HEAD to guarantee every commit is
   green.** After the split the final tree was diffed byte-for-byte against the pre-split working
   tree to confirm identity.
+
+### Slice 4 — T16 (stdio MCP server) implemented and verified (2026-10-15)
+
+Work-unit commits on `feat/memory-v2` (each is green on its own; tests ship with the code they
+verify):
+
+| Task | Commit | Summary |
+|---|---|---|
+| T16 | `7a1360b` | `feat(mcp): add a stdio MCP server over HanniGram.Core` |
+| T16 (release) | `c278fb8` | `build(release): ship the MCP server in the Windows asset` |
+| T16 (docs) | `b1aa933` | `docs: document the opt-in stdio MCP server` |
+| T16 (log) | _(this entry)_ | `docs: record the T16 MCP slice in the feature log` |
+
+New project `src/HanniGram.Mcp` (hand-rolled JSON-RPC 2.0, **no new NuGet dependency**: framing,
+dispatch and the tool layer are built on `System.Text.Json`), plus a second test project
+`tests/HanniGram.Mcp.Tests` (a plain library that `ProjectReference`s the MCP exe). Both are
+registered in `HanniGram.slnx`.
+
+Observed evidence (`dotnet --version` = `10.0.401`):
+
+- `dotnet build HanniGram.slnx -c Release --nologo` → **0 errors** (the same `NU1900` noise for the
+  unreachable feed `treball.original-soft.com`, plus the pre-existing `CS8604` in the Server).
+- `dotnet test HanniGram.slnx -c Release --nologo` → **180 passed, 0 failed** (122 Core + 58 MCP).
+- Four regressions were temporarily reverted and re-run, then restored (store confirmed untouched
+  by `git diff --stat`; no `TEMP REVERT` markers remain):
+  - **Bounded projection** (disable `Bounded.Text` truncation): `BoundedResultTests
+    .GetObservation_TruncatesAnOversizedBody` failed (1 failed / 3 passed).
+  - **Framing** (`WriteIndented = true`): `Framing_WritesOneMessagePerLine_WithNoEmbeddedNewlines`,
+    `TheStreamIsAnsweredPerLine_NotPerChunk` and `StdoutCarriesOnlyProtocolMessages_
+    AndDiagnosticsGoToStderr` failed (3 failed).
+  - **stdout purity** (route the ready line to stdout): the same stdout-purity test failed (1 failed).
+  - **Dispatch** (unknown method returns a normal result instead of an error):
+    `UnknownMethod_IsMethodNotFound` failed (1 failed).
+- **The coexistence revert did not fail any test, and that is the finding.** Removing the
+  `busy_timeout` pragma left a decisive probe green: a `DefaultTimeout = 0` connection against a
+  blocker holding `BEGIN IMMEDIATE` + `INSERT` printed `PROBE outcome=INSERT SUCCEEDED
+  elapsedMs=325`. `Microsoft.Data.Sqlite` retries on `SQLITE_BUSY` by itself (and
+  `DefaultTimeout = 0` means "wait indefinitely", not "fail fast"), so the coexistence guarantee is
+  **provider-enforced** and the store pragma is redundant belt-and-braces. The probe was removed
+  after the observation.
+- **End-to-end over real stdio** (temp db, temp project dir, and the HTTP daemon on a random free
+  port open on the *same* temp db):
+  - `initialize` echoed the client's `2025-06-18`, returned capabilities and
+    `serverInfo { name: "hannigram", version: "1.0.0" }`; `notifications/initialized` produced **no
+    line** (notifications are never answered).
+  - `tools/list` returned all **14** tools.
+  - `mem_save` (scope `global`, project alpha) → `id=2, created=true, scope=global`.
+  - `mem_search daemonsidewrite` from project alpha → **1 hit** (the daemon's write, scope
+    `project`); `mem_search mcpglobalwrite` from project beta → **1 hit** (the global row). That is
+    the cross-scope, cross-process read proven in both directions.
+  - stdout was **5 lines, all `jsonrpc:"2.0"`, 0 non-JSON-RPC lines**; the diagnostics
+    (`stdio server ready`, `initialize client=…`, `notification notifications/initialized`,
+    `stdin closed`) appeared **only on stderr**; exit code 0.
+  - The daemon (same temp db) then searched `mcpglobalwrite` → 1 hit (global) and `daemonsidewrite`
+    → 1 hit, with **no `SQLITE_BUSY`** and consistent reads — coexistence confirmed in the reverse
+    direction too.
+- **Cap exceedance at process level**: a 6000-char body came back as length **2001** (2000 + the
+  `…` marker) from both the `mem_save` echo and `mem_get_observation`. The bound holds.
+- **`scripts/pack-asset.ps1`** ran to completion (with `HANNIGRAM_DB` pointed at a temp file):
+  published Server + CLI + MCP, the daemon smoke test passed on `127.0.0.1:8799`, and the new MCP
+  smoke test (`initialize` + `tools/list` over stdio) passed. The zip
+  `artifacts\hannigram-windows-x64.zip` (110.5 MB, sha256
+  `abe62ff14bad7a3f44dae02c5f9dd82e2e858864a833f66151e37fd45926c2f0`) contains
+  `appsettings.json`, **`hannigram-mcp.exe`**, `hannigram.exe`, `HanniGram.Server.exe`,
+  `LEEME.txt`, `README-HanniGram.md`, `VERSION.txt`, `pi-extension/index.ts`,
+  `pi-extension/package.json`. The asset stayed **additive**: the daemon smoke test and the existing
+  entries are unchanged.
+
+#### The T16 contract
+
+- **Transport:** newline-delimited JSON-RPC 2.0 on stdin/stdout. stdout carries **only** protocol
+  messages; every log line goes to stderr (hard rule, tested).
+- **Protocol version:** the server declares the current stable `2025-11-25`, tolerates the client's
+  requested version, and falls back to `2025-11-25` for anything newer or unknown — `initialize`
+  never errors.
+- **Errors:** `-32700` parse error (with `id: null`), `-32601` unknown method, `-32602` unknown tool
+  or missing/mistyped argument; a not-found row or an unknown lifecycle value is a tool result with
+  `isError: true`. Notifications get no reply.
+- **Tools (14, sorted):** `mem_context, mem_current_project, mem_delete, mem_get_observation,
+  mem_pin, mem_promote, mem_review, mem_save, mem_search, mem_session_summary, mem_state,
+  mem_suggest_topic_key, mem_timeline, mem_update` — each maps onto an existing store method, with
+  no reimplemented logic.
+- **Scope/project resolution:** the per-call `project` argument, then `HANNIGRAM_CWD`, then the
+  process cwd; `HANNIGRAM_DB` with the same default as the daemon and CLI.
+- **Bounds:** `MaxItems = 50`, `MaxTitleChars = 200`, `MaxFieldChars = 2000`,
+  `MaxTokenChars = 200`; `limit` is clamped (not rejected) into `[1, 50]`. No tool ever returns an
+  unbounded body (`GetByTopicKey` is only bounded by the `mem_timeline` cap).
+
+#### What changed the plan (Slice 4)
+
+- **The coexistence guarantee is not the store's pragma.** The planned "remove `busy_timeout`,
+  watch the test fail" revert proved nothing because the provider already retries on `SQLITE_BUSY`.
+  The honest statement is that coexistence is provider-enforced; the store pragma stays as
+  belt-and-braces and the e2e (daemon + MCP on one temp db, reads both ways, no `SQLITE_BUSY`) is
+  the real evidence.
+- **The MCP project is an `Exe` with an explicit `static int Main`.** A top-level-statements `Program`
+  cannot be `ProjectReference`d by a test project, and the requirement asked for tests of the new
+  code; the explicit `Main` keeps the exe referenceable while staying a normal console entry point.
+- **Test fixtures must be trigram-disjoint.** FTS5 "absent term" assertions used terms that shared
+  trigrams with the seeded corpus and matched unexpectedly; the fixtures were reworked to disjoint
+  markers (`alpenglowsync`, `betatronlayout`, `quartzpromote`, `kestrelstale`, `daemonsidewrite`,
+  `mcpglobalwrite`, `quartzlongmarker`, `clampsearchmarker`, `coexistmarker`, `lockwaitmarker`,
+  `walreadmarker`).
+- **`instructions` was omitted from `initialize` and every tool description is ≤ 300 chars.** The MCP
+  surface enters a model's prompt, so T16 keeps it thin on purpose (this is the same "no token
+  overhead" thread as T15).
 
