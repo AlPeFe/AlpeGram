@@ -60,7 +60,9 @@ try
             {
                 $"# Memoria del proyecto — {resolvedProject}",
                 $"Generado por HanniGram ({DateTime.UtcNow:yyyy-MM-dd HH:mm} UTC).",
-                $"BD global: {dbPath}",
+                // Never the absolute database path: this file is meant to be committed
+                // and read on other machines, where a local path is wrong by definition.
+                "BD local (fuente de verdad): ~/.hannigram/hannigram.db — ruta configurable con HANNIGRAM_DB.",
                 $"Observaciones: {obs.Count}",
                 "",
                 "> HanniGram: memoria persistente con búsqueda FTS5 trigram (tolerante a typos).",
