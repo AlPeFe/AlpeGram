@@ -28,8 +28,23 @@ const READY_POLL_MS = 500;
 const READY_POLLS = 20;
 const UP_CACHE_TTL_MS = 15_000;
 
+/**
+ * Endpoint del daemon. `HANNIGRAM_URL` manda si está puesto; si no, se usa la primera URL de
+ * `HANNIGRAM_URLS` (la misma variable con la que se arranca el daemon), y solo entonces el default.
+ * Sin esto, un daemon en otro puerto se ignoraba y las escrituras caían en el de siempre.
+ */
 function baseUrl(): string {
-	return process.env.HANNIGRAM_URL ?? DEFAULT_BASE;
+	const explicit = process.env.HANNIGRAM_URL?.trim();
+	if (explicit) return explicit.replace(/\/+$/, "");
+	const urls = process.env.HANNIGRAM_URLS;
+	if (urls) {
+		const first = urls
+			.split(/[;,]/)
+			.map((url) => url.trim())
+			.find(Boolean);
+		if (first) return first.replace(/\/+$/, "");
+	}
+	return DEFAULT_BASE;
 }
 
 /** Small HTTP helper. Throws with the daemon's error message on failure. */
