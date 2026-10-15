@@ -1143,6 +1143,54 @@ public sealed class HanniGramStore : IDisposable
         }
     }
 
+    /// <summary>
+    /// The bounded global injection surface (T21): at most
+    /// <see cref="MaxPinnedGlobalHeuristics"/> pinned, non-archived global
+    /// heuristics plus at most <see cref="MaxRecentProjectRows"/> recent active
+    /// rows of <paramref name="projectId"/>, previews only. There is no parameter
+    /// to raise the caps — they are store constants — so an automatic context path
+    /// that reads this can never pay for the whole corpus on every request.
+    /// </summary>
+    public ContextSurface GetContextSurface(long projectId)
+    {
+        lock (_gate)
+        {
+            var global = ReadProjectByName(MemoryScopes.GlobalProjectName, null);
+            return new ContextSurface
+            {
+                PinnedGlobal = global is null
+                    ? Array.Empty<ContextItem>()
+                    : ReadContextItems(ContextPinnedGlobalSql, MemoryScopes.Global,
+                        ("$p", global.Id), ("$archived", MemoryStates.Archived), ("$l", MaxPinnedGlobalHeuristics)),
+                RecentProject = ReadContextItems(ContextRecentProjectSql, ScopeOfProject(projectId),
+                    ("$p", projectId), ("$active", MemoryStates.Active), ("$l", MaxRecentProjectRows)),
+            };
+        }
+    }
+
+    private IReadOnlyList<ContextItem> ReadContextItems(string sql, string scope, params (string Name, object Value)[] parameters)
+    {
+        var list = new List<ContextItem>();
+        using var cmd = CreateCommand();
+        cmd.CommandText = sql;
+        foreach (var (name, value) in parameters) cmd.Parameters.AddWithValue(name, value);
+        using var r = cmd.ExecuteReader();
+        while (r.Read())
+        {
+            list.Add(new ContextItem
+            {
+                Id = r.GetInt64(0),
+                Title = Preview(r.GetString(1), TitlePreviewChars),
+                Preview = Preview(r.GetString(2), ContextPreviewChars),
+                TopicKey = r.IsDBNull(3) ? null : r.GetString(3),
+                Type = r.IsDBNull(4) ? null : r.GetString(4),
+                Scope = scope,
+                Pinned = r.GetInt64(5) != 0,
+            });
+        }
+        return list;
+    }
+
     public IReadOnlyList<string> SuggestTopicKeys(long projectId, int limit = 20)
     {
         lock (_gate)
@@ -1257,10 +1305,28 @@ public sealed class HanniGramStore : IDisposable
     // ask for more, so the review response can never become a corpus dump.
     public const int MaxReviewItems = 50;
 
+    // The global injection budget. Pinned global heuristics are the ONLY global
+    // memory eligible for the automatic context path, and the count is fixed here;
+    // these are the single, explicit place to change the budget.
+    public const int MaxPinnedGlobalHeuristics = 3;
+    public const int MaxRecentProjectRows = 6;
+
     // Preview bounds. Every review row and every context row is truncated: the body
     // never leaves the store on a bounded surface.
     private const int TitlePreviewChars = 80;
     private const int ReviewPreviewChars = 200;
+    private const int ContextPreviewChars = 160;
+
+    // The two halves of the context surface. Both are parameterised so a caller
+    // cannot inject an ORDER BY or a larger LIMIT.
+    private const string ContextPinnedGlobalSql =
+        "SELECT id, title, content, topic_key, type, pinned FROM observations " +
+        "WHERE project_id = $p AND pinned = 1 AND state <> $archived " +
+        "ORDER BY updated_at_utc DESC, id DESC LIMIT $l";
+    private const string ContextRecentProjectSql =
+        "SELECT id, title, content, topic_key, type, pinned FROM observations " +
+        "WHERE project_id = $p AND state = $active " +
+        "ORDER BY pinned DESC, updated_at_utc DESC, id DESC LIMIT $l";
 
     /// <summary>
     /// Collapse whitespace and truncate to <paramref name="max"/> characters with a

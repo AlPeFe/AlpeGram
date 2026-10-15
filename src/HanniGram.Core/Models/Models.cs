@@ -124,3 +124,29 @@ public sealed class ReviewItem
     /// <summary>For a duplicate candidate, the id of the earlier row it duplicates.</summary>
     public long? DuplicateOfId { get; set; }
 }
+
+/// <summary>
+/// One bounded entry of the automatic context path. The preview is truncated and
+/// the body is never included, so an injection paid on every request stays cheap.
+/// </summary>
+public sealed class ContextItem
+{
+    public long Id { get; set; }
+    public required string Title { get; set; }
+    public required string Preview { get; set; }
+    public string? TopicKey { get; set; }
+    public string? Type { get; set; }
+    public string? Scope { get; set; }
+    public bool Pinned { get; set; }
+}
+
+/// <summary>
+/// The bounded global injection surface: at most a small fixed number of pinned
+/// global heuristics plus a bounded number of recent project rows, previews only.
+/// The caps are store constants; a caller cannot raise them.
+/// </summary>
+public sealed class ContextSurface
+{
+    public IReadOnlyList<ContextItem> PinnedGlobal { get; set; } = Array.Empty<ContextItem>();
+    public IReadOnlyList<ContextItem> RecentProject { get; set; } = Array.Empty<ContextItem>();
+}

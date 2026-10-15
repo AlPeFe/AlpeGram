@@ -180,6 +180,14 @@ app.MapGet("/api/review", (HttpRequest req, int limit = 20, string? scope = null
     return Results.Json(store.ReviewObservations(namespaces, limit), json);
 });
 
+// Bounded global injection surface (T21): pinned global heuristics plus recent
+// project rows, previews only, fixed caps. There is no limit parameter by design.
+app.MapGet("/api/context", (HttpRequest req) =>
+{
+    var p = ResolveProject(req);
+    return Results.Json(store.GetContextSurface(p.Id), json);
+});
+
 app.MapGet("/api/observations/topic/{topicKey}", (string topicKey, HttpRequest req) =>
 {
     var p = ResolveProject(req);
