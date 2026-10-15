@@ -21,11 +21,14 @@ SQLite + FTS5 (~/.hannigram/hannigram.db)
 ## Qué hace
 
 - **Memoria por proyecto** — resuelve el proyecto desde el directorio de trabajo (git remote cuando está disponible), así cada proyecto tiene su propio espacio de memoria.
+- **Dos ámbitos: `project` y `global`** — `project` es el espacio del repositorio; `global` es una memoria compartida por **todos** los proyectos, para lo que no es un hecho del repo sino una heurística que se repite: cómo montas una consola, tus convenciones de commit, en qué capas separas el código. Se elige al escribir (`scope=project|global`) y `hannigram promote <id>` sube al ámbito global un hallazgo que resultó genérico; si el `topic_key` ya existe allí, el nuevo contenido gana **sobre la fila global, en el sitio** (sin duplicados). Los dos ámbitos comparten un único store, un único índice FTS y el mismo upsert por `topic_key`.
 - **Observaciones estructuradas** — What / Why / Where / Learned, con título y tipo buscables.
 - **Búsqueda de texto completo** — SQLite FTS5 sobre las observaciones, con **tokenizer trigram**: tolera typos (buscar `rozado` encuentra `rosado`), substrings y CJK. Si el match estricto no da resultados, reintenta con los trigramas de la query (fuzzy) rankeado por bm25.
+- **Búsqueda entre ámbitos** — `hannigram search` y `/api/search` aceptan `scope=project|global|all` (por defecto `all`): devuelven los aciertos del proyecto **y** los globales en un solo resultado, cada uno etiquetado con su origen, para que el modelo distinga un hecho del repo de una heurística universal.
 - **ADR / decisiones** — las observaciones con `type=adr` y `topic_key=adr/<slug>` son decisiones de arquitectura/convención (p.ej. `adr/ui/palette`). Son la base de "respetar estilos": HanniPI las consulta antes de implementar en zonas cubiertas, sin redefinirlas en cada prompt.
-- **Memoria local exportada** — `hannigram init` crea el proyecto en la BD **y** escribe `.hannigram/memory.md` en el proyecto: una vista markdown de las decisiones, para que cualquier harness (o persona) que solo trabaje con ficheros lea la memoria sin depender del daemon. La BD sigue siendo la fuente de verdad.
+- **Memoria local exportada** — `hannigram init` crea el proyecto en la BD **y** escribe `.hannigram/memory.md` en el proyecto: una vista markdown de las decisiones, para que cualquier harness (o persona) que solo trabaje con ficheros lea la memoria sin depender del daemon. La BD sigue siendo la fuente de verdad. El fichero **no** embebe rutas absolutas de la máquina (solo nombra la ruta por defecto de la BD y su variable de entorno), así que se puede commitear sin filtrar el disco de nadie.
 - **Topic keys** — claves estables (`architecture/auth-model`) para mantener el conocimiento evolutivo en un solo lugar. Guardar con un `topic_key` ya existente **actualiza** la observación (upsert) en vez de crear una versión duplicada.
+- **Corregir sin duplicar** — `hannigram update <id>` (`mem_update` / `PUT /api/observations/{id}`) edita una observación existente: solo cambia los campos que le pasas, conserva `created_at` y mueve `updated_at`, y las filas siguen escopadas a su ámbito.
 - **Sesiones + handoff** — `session_summary` guarda objetivo, descubrimientos y próximos pasos para que la siguiente sesión recupere el contexto.
 - **Ciclo de vida y revisión** — cada observación tiene un estado (`active` / `needs_review` / `archived`) y un flag `pinned`. Las lecturas devuelven solo `active` por defecto; `archived` es el olvido seguro (la fila se conserva) y queda excluida salvo que se pida con `state=`. Guardar devuelve un aviso `review` compacto cuando sobrescribe un `topic_key` o detecta un casi-duplicado; `GET /api/review` los lista acotados con previews truncados. La inyección automática (`GET /api/context`) se limita a un número fijo de heurísticas globales fijadas (`pinned`) más unas pocas filas recientes del proyecto.
 
@@ -109,7 +112,7 @@ HanniGram no se instancia siempre. Siguiendo la filosofía **sODD** (orgánico, 
 - **Manual**: `hannigram init` (o `/hannigram init` en HanniPI) cuando tú decides que el proyecto merece memoria.
 - **Automático (sODD)**: cuando el proyecto es lo bastante grande y se toman decisiones importantes que conviene recordar, el orquestador lo sugiere/activa.
 
-La memoria guarda **contexto combinado y relacionado** — no solo observaciones sueltas: decisiones (ADR), sesiones, y las relaciones entre ellas. Al reabrir un proyecto, HanniPI inyecta un **índice ligero** (número de ADR, temas, última decisión) y recupera la ADR completa **bajo demanda** cuando la tarea la necesita — sin releer todos los ficheros ni gastar tokens de más.
+La memoria guarda **contexto combinado y relacionado** — no solo observaciones sueltas: decisiones (ADR), sesiones, y las relaciones entre ellas. En **cada** turno (el hook de contexto de HanniPI dispara antes de cada llamada al modelo), HanniPI inyecta un **índice ligero** de la memoria del proyecto — las ADR y las observaciones recientes, con título, `topic_key` y `learned`, nunca el contenido completo — y recupera la observación completa **bajo demanda** cuando la tarea la necesita, sin releer todos los ficheros ni gastar tokens de más. La inyección **no** está condicionada a que haya una tarea o ficha activa: ocurre siempre que el proyecto tenga observaciones que encajen.
 
 **Respetar estilos/convenciones**: una ADR marcada como convención (p.ej. `adr/ui/palette`) se aplica siempre en las zonas que cubre; si hay duda, el agente pregunta. Así decides el estilo una vez y todas las llamadas lo respetan, sin redefinirlo en cada prompt.
 
@@ -117,7 +120,11 @@ La memoria guarda **contexto combinado y relacionado** — no solo observaciones
 
 El directorio `pi-extension/` es una extensión de Pi que registra las tools `mem_*`. Pi la descubre vía el campo `pi.extensions` de su `package.json` (o añadiendo la ruta al array `extensions` de `~/.pi/agent/settings.json`).
 
-Tools: `mem_current_project`, `mem_save`, `mem_search`, `mem_context`, `mem_timeline`, `mem_get_observation`, `mem_suggest_topic_key`, `mem_session_summary`.
+Tools: `mem_current_project`, `mem_save`, `mem_search`, `mem_context`, `mem_timeline`, `mem_get_observation`, `mem_suggest_topic_key`, `mem_session_summary`, `mem_update`, `mem_review`, `mem_promote`, `mem_state`, `mem_pin`.
+
+`mem_save` acepta `scope=project|global` y `mem_search` acepta `scope=project|global|all` (cada acierto llega etiquetado con su origen); `mem_update`, `mem_state` y `mem_pin` aceptan `scope` para elegir a qué ámbito pertenece la fila. `mem_delete` borra en el ámbito del proyecto actual.
+
+Todas las tools son **bajo demanda**: la extensión no inyecta memoria en el prompt por sí sola ni inyecta texto completo de una observación.
 
 ```bash
 cd pi-extension && npm install   # typebox + jiti (para el script de verificación)
@@ -159,11 +166,12 @@ El binario Windows x64 (daemon + CLI + servidor MCP self-contained, sin .NET en 
 `hannigram-windows-x64.zip` y es la **fuente de verdad** del motor:
 
 ```bash
-git tag v0.1.0 && git push origin v0.1.0     # dispara .github/workflows/release.yml
+git tag v0.2.0 && git push origin v0.2.0     # dispara .github/workflows/release.yml
 ```
 
 El workflow (Windows) publica el exe, hace smoke test de `/health`, empaqueta con `scripts/pack-asset.ps1`
 y crea la release con `hannigram-windows-x64.zip`, `SHA256SUMS` y `VERSION.txt` (tag, commit, fecha).
+El detalle de cada release está en [`CHANGELOG.md`](CHANGELOG.md).
 
 El asset incluye `pi-extension/` (y el `hannigram-mcp.exe` opt-in), así que quien lo instala obtiene daemon + CLI + server MCP + tools `mem_*` de una vez.
 HanniPI copia este mismo asset **pinneado** en su release (ver `HanniPI/.pi/skills/release.md`) para que
