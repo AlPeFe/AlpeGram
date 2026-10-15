@@ -117,6 +117,22 @@ Verifica la extensión contra un daemon en ejecución:
 node --experimental-strip-types --no-warnings verify-extension.mjs
 ```
 
+## Releases
+
+El binario Windows x64 (daemon + CLI self-contained, sin .NET en la máquina destino) se publica aquí como
+`hannigram-windows-x64.zip` y es la **fuente de verdad** del motor:
+
+```bash
+git tag v0.1.0 && git push origin v0.1.0     # dispara .github/workflows/release.yml
+```
+
+El workflow (Windows) publica el exe, hace smoke test de `/health`, empaqueta con `scripts/pack-asset.ps1`
+y crea la release con `hannigram-windows-x64.zip`, `SHA256SUMS` y `VERSION.txt` (tag, commit, fecha).
+
+El asset incluye `pi-extension/`, así que quien lo instala obtiene daemon + CLI + tools `mem_*` de una vez.
+HanniPI copia este mismo asset **pinneado** en su release (ver `HanniPI/.pi/skills/release.md`) para que
+instalar HanniPI+memoria sea una sola descarga; `hanni-setup.ps1 -Hannigram latest` trae la última de aquí.
+
 ## Licencia
 
 MIT

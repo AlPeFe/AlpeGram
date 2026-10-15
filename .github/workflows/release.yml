@@ -1,0 +1,67 @@
+name: Release HanniGram
+
+# El binario del daemon se publica aquí (fuente de verdad) y HanniPI lo copia
+# pinneado en su propia release. Ver README > Releases.
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag to build (e.g. v0.1.0); el tag debe existir'
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.event.inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    # Windows para poder hacer el smoke test del exe win-x64 recién empaquetado.
+    runs-on: windows-latest
+    env:
+      RELEASE_TAG: ${{ github.event.inputs.tag || github.ref_name }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+          fetch-depth: 0
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+
+      - name: Build release asset
+        shell: pwsh
+        run: ./scripts/pack-asset.ps1 -Version "$env:RELEASE_TAG"
+
+      - name: Verify assets
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          foreach ($file in @("artifacts/hannigram-windows-x64.zip", "artifacts/SHA256SUMS", "artifacts/VERSION.txt")) {
+            if (-not (Test-Path $file)) { throw "Falta $file" }
+          }
+          Get-Content artifacts/VERSION.txt
+
+      - name: Publish GitHub Release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $tag = $env:RELEASE_TAG
+          $existing = gh release view $tag --json isDraft --jq .isDraft 2>$null
+          if ($existing -eq "false") {
+            throw "La release $tag ya esta publicada; no la toco (sube un tag nuevo)."
+          }
+          if ($existing -eq "true") { gh release delete $tag --yes }
+          gh release create $tag --verify-tag --title "HanniGram $tag" --generate-notes `
+            artifacts/hannigram-windows-x64.zip artifacts/SHA256SUMS artifacts/VERSION.txt
