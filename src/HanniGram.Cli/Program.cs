@@ -8,8 +8,11 @@ using static HanniGram.Core.Cli.CwdResolver;
 //   hannigram project [cwd]                 resolve project for a cwd
 //   hannigram init [--cwd]                  init project memory (BD + .hannigram/memory.md local export)
 //   hannigram save <title> [--content] [--what] [--why] [--where] [--learned] [--topic] [--type] [--scope] [--project] [--cwd]
-//   hannigram search <query> [--limit] [--scope] [--project] [--cwd]
-//   hannigram list [--limit] [--project] [--cwd]
+//   hannigram state <id> --set active|needs_review|archived [--scope] [--project] [--cwd]
+//   hannigram pin <id> [--off] [--scope] [--project] [--cwd]
+//   hannigram search <query> [--limit] [--state] [--scope] [--project] [--cwd]
+//   hannigram list [--limit] [--state] [--project] [--cwd]
+//   hannigram review [--limit] [--scope] [--project] [--cwd]
 //   hannigram topics [--project] [--cwd]
 //   hannigram session-start [--id] [--project] [--cwd]
 //   hannigram session-end <id> [--summary] [--goal] [--next] [--project] [--cwd]
@@ -103,7 +106,7 @@ try
                 ? store.GetOrCreateProject(resolvedProject, cwd).Id
                 : (long?)null;
             var namespaces = store.NamespacesFor(projectId, scope, MemoryScopes.All);
-            foreach (var hit in store.Search(namespaces, q, limit))
+            foreach (var hit in store.Search(namespaces, q, limit, state: Flag(rest, "--state")))
                 Console.WriteLine($"[{hit.Rank:F2}] ({hit.Scope}) #{hit.Id} {hit.Title} — {Truncate(hit.Content, 80)}");
             break;
         }
@@ -112,8 +115,64 @@ try
         {
             var p = store.GetOrCreateProject(resolvedProject, cwd);
             var limit = IntFlag(rest, "--limit", 50);
-            foreach (var obs in store.ListObservations(p.Id, limit))
+            foreach (var obs in store.ListObservations(p.Id, limit, Flag(rest, "--state")))
                 Console.WriteLine($"#{obs.Id} [{obs.TopicKey ?? "-"}] {obs.Title} ({obs.CreatedAtUtc:yyyy-MM-dd})");
+            break;
+        }
+
+        case "state":
+        {
+            // Lifecycle state by id. Archive is the safe forget; mem_delete stays for
+            // real deletion.
+            var id = long.Parse(Positional(rest) ?? throw new ArgumentException("id required"));
+            var value = Flag(rest, "--set") ?? throw new ArgumentException("--set active|needs_review|archived required");
+            var scope = MemoryScopes.ResolveScope(Flag(rest, "--scope"), MemoryScopes.Project);
+            var p = scope == MemoryScopes.Global
+                ? store.GetOrCreateGlobalProject()
+                : store.GetOrCreateProject(resolvedProject, cwd);
+            var updated = store.SetObservationState(p.Id, id, value);
+            if (updated is null)
+            {
+                Console.Error.WriteLine($"error: observation #{id} not found or invalid state '{value}'");
+                Environment.ExitCode = 1;
+                break;
+            }
+            Console.WriteLine($"#{updated.Id} state={updated.State} [{p.Name}]");
+            break;
+        }
+
+        case "pin":
+        {
+            var id = long.Parse(Positional(rest) ?? throw new ArgumentException("id required"));
+            var pinned = Flag(rest, "--off") is null;
+            var scope = MemoryScopes.ResolveScope(Flag(rest, "--scope"), MemoryScopes.Project);
+            var p = scope == MemoryScopes.Global
+                ? store.GetOrCreateGlobalProject()
+                : store.GetOrCreateProject(resolvedProject, cwd);
+            var updated = store.SetObservationPinned(p.Id, id, pinned);
+            if (updated is null)
+            {
+                Console.Error.WriteLine($"error: observation #{id} not found in scope {scope}");
+                Environment.ExitCode = 1;
+                break;
+            }
+            Console.WriteLine($"#{updated.Id} pinned={updated.Pinned} [{p.Name}]");
+            break;
+        }
+
+        case "review":
+        {
+            // Bounded review listing (needs_review + duplicate candidates), previews only.
+            var scope = Flag(rest, "--scope");
+            var limit = IntFlag(rest, "--limit", 20);
+            var projectId = MemoryScopes.Selection(scope, MemoryScopes.All).IncludeProject
+                ? store.GetOrCreateProject(resolvedProject, cwd).Id
+                : (long?)null;
+            var namespaces = store.NamespacesFor(projectId, scope, MemoryScopes.All);
+            foreach (var item in store.ReviewObservations(namespaces, limit))
+                Console.WriteLine($"[{item.Kind}] #{item.Id} ({item.Scope}) {item.Title}"
+                    + (item.DuplicateOfId is null ? "" : $" ~ duplica #{item.DuplicateOfId}")
+                    + $" — {item.Preview}");
             break;
         }
 
@@ -171,8 +230,11 @@ static void Help() => Console.WriteLine("""
     Usage:
       hannigram project [cwd]
       hannigram save <title> [--content] [--what] [--why] [--where] [--learned] [--topic] [--type] [--scope project|global] [--project] [--cwd]
-      hannigram search <query> [--limit] [--scope project|global|all] [--project] [--cwd]
-      hannigram list [--limit] [--project] [--cwd]
+      hannigram state <id> --set active|needs_review|archived [--scope project|global] [--project] [--cwd]
+      hannigram pin <id> [--off] [--scope project|global] [--project] [--cwd]
+      hannigram search <query> [--limit] [--state active|needs_review|archived|all] [--scope project|global|all] [--project] [--cwd]
+      hannigram list [--limit] [--state active|needs_review|archived|all] [--project] [--cwd]
+      hannigram review [--limit] [--scope project|global|all] [--project] [--cwd]
       hannigram topics [--project] [--cwd]
       hannigram session-start [--id] [--project] [--cwd]
       hannigram session-end <id> [--summary] [--goal] [--next] [--project] [--cwd]
@@ -181,6 +243,9 @@ static void Help() => Console.WriteLine("""
     Scope: save defaults to the caller's project namespace; --scope global writes
     the shared cross-project memory. search defaults to --scope all (project and
     global hits, each tagged with its origin); use project or global to narrow it.
+
+    Lifecycle: reads return active rows only; pass --state to see needs_review,
+    archived or all. state --set archives (safe forget) instead of deleting.
 
     Env: HANNIGRAM_DB (db path), HANNIGRAM_CWD (default cwd)
     """);

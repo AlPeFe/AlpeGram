@@ -976,6 +976,97 @@ public sealed class HanniGramStore : IDisposable
         }
     }
 
+    /// <summary>
+    /// Bounded review listing: rows flagged <c>needs_review</c> plus duplicate
+    /// candidates, with truncated previews and a hard cap. The response never
+    /// carries an observation body.
+    /// </summary>
+    public IReadOnlyList<ReviewItem> ReviewObservations(IReadOnlyList<MemoryNamespace> namespaces, int limit = MaxReviewItems)
+    {
+        lock (_gate)
+        {
+            limit = Math.Clamp(limit, 1, MaxReviewItems);
+            var items = new List<ReviewItem>();
+            if (namespaces.Count == 0) return items;
+
+            var scopeById = new Dictionary<long, string>();
+            foreach (var n in namespaces) scopeById[n.ProjectId] = n.Scope;
+            var ids = scopeById.Keys.ToArray();
+
+            // Flagged rows first: they are the priority, and the same hard cap bounds
+            // both this query and the whole listing.
+            using (var cmd = CreateCommand())
+            {
+                cmd.CommandText =
+                    "SELECT id, project_id, title, content, state FROM observations WHERE project_id IN ("
+                    + string.Join(", ", ids.Select((_, i) => "$p" + i))
+                    + ") AND state = $review ORDER BY updated_at_utc DESC, id DESC LIMIT $l";
+                for (var i = 0; i < ids.Length; i++) cmd.Parameters.AddWithValue("$p" + i, ids[i]);
+                cmd.Parameters.AddWithValue("$review", MemoryStates.NeedsReview);
+                cmd.Parameters.AddWithValue("$l", limit);
+                using var r = cmd.ExecuteReader();
+                while (r.Read())
+                {
+                    items.Add(new ReviewItem
+                    {
+                        Kind = "needs_review",
+                        Id = r.GetInt64(0),
+                        Title = Preview(r.GetString(2), TitlePreviewChars),
+                        Preview = Preview(r.GetString(3), ReviewPreviewChars),
+                        State = r.GetString(4),
+                        Scope = scopeById.TryGetValue(r.GetInt64(1), out var s) ? s : MemoryScopes.Project,
+                    });
+                }
+            }
+
+            // Duplicate candidates: pairwise within the bounded recent window of each
+            // namespace. O(window^2) on small token sets — deterministic, no LLM —
+            // and still bounded by the same limit.
+            foreach (var ns in namespaces)
+            {
+                if (items.Count >= limit) break;
+                ScanDuplicates(ns, items, limit);
+            }
+            return items;
+        }
+    }
+
+    private void ScanDuplicates(MemoryNamespace ns, List<ReviewItem> items, int limit)
+    {
+        var rows = new List<(long Id, string Title, string Content)>();
+        using (var cmd = CreateCommand())
+        {
+            cmd.CommandText = "SELECT id, title, content FROM observations WHERE project_id = $p AND state <> $archived ORDER BY updated_at_utc DESC, id DESC LIMIT $w";
+            cmd.Parameters.AddWithValue("$p", ns.ProjectId);
+            cmd.Parameters.AddWithValue("$archived", MemoryStates.Archived);
+            cmd.Parameters.AddWithValue("$w", MemoryDedup.WindowSize);
+            using var r = cmd.ExecuteReader();
+            while (r.Read()) rows.Add((r.GetInt64(0), r.GetString(1), r.GetString(2)));
+        }
+
+        var signatures = rows.Select(row => MemoryDedup.Signature(row.Title, row.Content)).ToArray();
+        for (var i = 0; i < rows.Count; i++)
+        {
+            if (items.Count >= limit) return;
+            // rows are newest-first: i is the newer row, j the older one it may
+            // duplicate. One partner per row keeps the listing from ballooning.
+            for (var j = i + 1; j < rows.Count; j++)
+            {
+                if (MemoryDedup.Dice(signatures[i], signatures[j]) < MemoryDedup.NearDuplicateThreshold) continue;
+                items.Add(new ReviewItem
+                {
+                    Kind = "duplicate",
+                    Id = rows[i].Id,
+                    Title = Preview(rows[i].Title, TitlePreviewChars),
+                    Preview = Preview(rows[i].Content, ReviewPreviewChars),
+                    Scope = ns.Scope,
+                    DuplicateOfId = rows[j].Id,
+                });
+                break;
+            }
+        }
+    }
+
     public IReadOnlyList<string> SuggestTopicKeys(long projectId, int limit = 20)
     {
         lock (_gate)
@@ -1086,9 +1177,14 @@ public sealed class HanniGramStore : IDisposable
     // Bounded surfaces (review / automatic context)
     // =====================================================================
 
+    // The hard cap on the review listing. A caller may ask for fewer; nobody can
+    // ask for more, so the review response can never become a corpus dump.
+    public const int MaxReviewItems = 50;
+
     // Preview bounds. Every review row and every context row is truncated: the body
     // never leaves the store on a bounded surface.
     private const int TitlePreviewChars = 80;
+    private const int ReviewPreviewChars = 200;
 
     /// <summary>
     /// Collapse whitespace and truncate to <paramref name="max"/> characters with a

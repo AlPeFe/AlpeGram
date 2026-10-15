@@ -69,6 +69,15 @@ long? ProjectIdForRead(HttpRequest req, string? scope, string defaultScope)
     return includeProject ? ResolveProject(req).Id : null;
 }
 
+// A mutation by id is scoped explicitly: "project" (default) is the caller's own
+// namespace, "global" is the shared sentinel. Resolving the sentinel here is safe
+// because the row being mutated already exists in it.
+long ProjectIdForWrite(HttpRequest req, string? scope)
+{
+    var resolved = MemoryScopes.ResolveScope(scope, MemoryScopes.Project);
+    return resolved == MemoryScopes.Global ? store.GetOrCreateGlobalProject().Id : ResolveProject(req).Id;
+}
+
 // ---- Health ----
 app.MapGet("/health", () => Results.Json(new { status = "ok", db = dbPath }, json));
 
@@ -101,6 +110,24 @@ app.MapPost("/api/observations", (HttpRequest req, ObservationBody body) =>
     return Results.Json(new { observation = obs, created, scope, review }, json);
 });
 
+// Change lifecycle state or pin by id (T15). Archive is the safe default over
+// delete; mem_delete (DELETE /api/observations/{id}) stays for real deletion.
+app.MapPost("/api/observations/{id:long}/state", (long id, HttpRequest req, ObservationStateBody body) =>
+{
+    if (!MemoryStates.IsKnownState(body.State))
+        return Results.BadRequest(new { error = "invalid_state" });
+    var projectId = ProjectIdForWrite(req, req.Query["scope"].FirstOrDefault());
+    var obs = store.SetObservationState(projectId, id, body.State);
+    return obs is null ? Results.NotFound() : Results.Json(obs, json);
+});
+
+app.MapPost("/api/observations/{id:long}/pin", (long id, HttpRequest req, ObservationPinBody body) =>
+{
+    var projectId = ProjectIdForWrite(req, req.Query["scope"].FirstOrDefault());
+    var obs = store.SetObservationPinned(projectId, id, body.Pinned);
+    return obs is null ? Results.NotFound() : Results.Json(obs, json);
+});
+
 app.MapGet("/api/observations/{id:long}", (long id, HttpRequest req) =>
 {
     var p = ResolveProject(req);
@@ -128,10 +155,18 @@ app.MapPost("/api/observations/{id:long}/promote", (long id, HttpRequest req) =>
     return Results.Json(new { observation, merged, outcome = merged ? "merged" : "moved" }, json);
 });
 
-app.MapGet("/api/observations", (HttpRequest req, int limit = 50, string? scope = null) =>
+app.MapGet("/api/observations", (HttpRequest req, int limit = 50, string? scope = null, string? state = null) =>
 {
     var namespaces = store.NamespacesFor(ProjectIdForRead(req, scope, MemoryScopes.All), scope, MemoryScopes.All);
-    return Results.Json(store.ListObservations(namespaces, limit), json);
+    return Results.Json(store.ListObservations(namespaces, limit, state), json);
+});
+
+// Bounded review listing (T15): needs_review rows plus duplicate candidates, with
+// truncated previews and a hard cap. Never returns an observation body.
+app.MapGet("/api/review", (HttpRequest req, int limit = 20, string? scope = null) =>
+{
+    var namespaces = store.NamespacesFor(ProjectIdForRead(req, scope, MemoryScopes.All), scope, MemoryScopes.All);
+    return Results.Json(store.ReviewObservations(namespaces, limit), json);
 });
 
 app.MapGet("/api/observations/topic/{topicKey}", (string topicKey, HttpRequest req) =>
@@ -141,10 +176,10 @@ app.MapGet("/api/observations/topic/{topicKey}", (string topicKey, HttpRequest r
 });
 
 // ---- Search (FTS5) ----
-app.MapGet("/api/search", (HttpRequest req, string q, int limit = 10, string? type = null, string? topicKey = null, string? scope = null) =>
+app.MapGet("/api/search", (HttpRequest req, string q, int limit = 10, string? type = null, string? topicKey = null, string? scope = null, string? state = null) =>
 {
     var namespaces = store.NamespacesFor(ProjectIdForRead(req, scope, MemoryScopes.All), scope, MemoryScopes.All);
-    return Results.Json(store.Search(namespaces, q, limit, type, topicKey), json);
+    return Results.Json(store.Search(namespaces, q, limit, type, topicKey, state), json);
 });
 
 // ---- Topic keys ----
@@ -204,4 +239,17 @@ public sealed class SessionEndBody
     public string? Summary { get; set; }
     public string? Goal { get; set; }
     public string? NextSteps { get; set; }
+}
+
+/// <summary>Body for <c>POST /api/observations/{id}/state</c> (T13/T15).</summary>
+public sealed class ObservationStateBody
+{
+    /// <summary>"active", "needs_review" or "archived".</summary>
+    public required string State { get; set; }
+}
+
+/// <summary>Body for <c>POST /api/observations/{id}/pin</c> (T15/T21).</summary>
+public sealed class ObservationPinBody
+{
+    public bool Pinned { get; set; }
 }

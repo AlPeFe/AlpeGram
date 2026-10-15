@@ -107,3 +107,20 @@ public sealed class SaveReviewHint
     /// <summary>The colliding row's title, truncated to a few dozen characters.</summary>
     public required string Title { get; set; }
 }
+
+/// <summary>
+/// One bounded entry of the review listing. Previews are truncated; the review
+/// response never returns an observation body.
+/// </summary>
+public sealed class ReviewItem
+{
+    /// <summary>"needs_review" or "duplicate".</summary>
+    public required string Kind { get; set; }
+    public long Id { get; set; }
+    public required string Title { get; set; }
+    public required string Preview { get; set; }
+    public string? State { get; set; }
+    public string? Scope { get; set; }
+    /// <summary>For a duplicate candidate, the id of the earlier row it duplicates.</summary>
+    public long? DuplicateOfId { get; set; }
+}
