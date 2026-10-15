@@ -2,6 +2,7 @@ bin/
 obj/
 *.user
 .vs/
+.codegraph/
 pi-extension/node_modules/
 pi-extension/package-lock.json
 artifacts/

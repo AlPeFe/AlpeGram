@@ -1,0 +1,19 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <AssemblyName>HanniGram.Mcp</AssemblyName>
+    <RootNamespace>HanniGram.Mcp</RootNamespace>
+  </PropertyGroup>
+
+  <!-- The MCP implementation is hand-rolled on System.Text.Json on purpose: an
+       MCP protocol package would be a new external dependency to restore in this
+       environment and in the release workflow. -->
+  <ItemGroup>
+    <ProjectReference Include="..\HanniGram.Core\HanniGram.Core.csproj" />
+  </ItemGroup>
+
+</Project>

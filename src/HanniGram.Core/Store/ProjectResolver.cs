@@ -10,13 +10,33 @@ public static class ProjectResolver
     public static string Resolve(string cwd)
     {
         var gitRemote = TryGetGitRemote(cwd);
-        if (gitRemote != null) return gitRemote;
+        if (gitRemote != null) return GuardAgainstSentinel(gitRemote, cwd);
 
         var dirName = Path.GetFileName(Path.TrimEndingDirectorySeparator(cwd));
-        if (!string.IsNullOrWhiteSpace(dirName)) return dirName;
+        if (!string.IsNullOrWhiteSpace(dirName)) return GuardAgainstSentinel(dirName, cwd);
 
-        return cwd.Replace('\\', '/').Trim('/').Replace('/', '-');
+        return GuardAgainstSentinel(NormalizePath(cwd), cwd);
     }
+
+    /// <summary>
+    /// A real directory or git remote must NEVER resolve to the reserved global
+    /// sentinel: a folder (or remote) literally named <c>_global</c> would
+    /// otherwise silently read and write the global namespace as if it were a
+    /// project. On a collision the normalized absolute path is returned, which
+    /// is unambiguous. The <c>-local</c> suffix covers the pathless edge case
+    /// (a bare relative cwd equal to the sentinel).
+    /// </summary>
+    private static string GuardAgainstSentinel(string name, string cwd)
+    {
+        if (!string.Equals(name, MemoryScopes.GlobalProjectName, StringComparison.Ordinal)) return name;
+
+        var path = NormalizePath(cwd);
+        return string.Equals(path, MemoryScopes.GlobalProjectName, StringComparison.Ordinal)
+            ? path + "-local"
+            : path;
+    }
+
+    private static string NormalizePath(string cwd) => cwd.Replace('\\', '/').Trim('/').Replace('/', '-');
 
     private static string? TryGetGitRemote(string cwd)
     {

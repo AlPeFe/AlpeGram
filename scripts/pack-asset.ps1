@@ -1,8 +1,9 @@
 # Canonical HanniGram release asset builder.
 #
-# Produces `hannigram-windows-x64.zip`: the self-contained win-x64 daemon + CLI
-# (no .NET runtime needed on the target machine) plus the `pi-extension/` that
-# registers the mem_* tools, plus VERSION.txt with the source revision.
+# Produces `hannigram-windows-x64.zip`: the self-contained win-x64 daemon + CLI +
+# MCP server (no .NET runtime needed on the target machine) plus the
+# `pi-extension/` that registers the mem_* tools, plus VERSION.txt with the
+# source revision.
 #
 # The same asset is consumed twice:
 #   - by HanniGram's own GitHub Release (tag `v*`), which is the source of truth
@@ -81,24 +82,29 @@ $publishArgs = @(
 
 $serverOut = Join-Path $publishRoot "server"
 $cliOut = Join-Path $publishRoot "cli"
+$mcpOut = Join-Path $publishRoot "mcp"
 Write-Step "Publicando HanniGram.Server ($Runtime)"
 Invoke-Dotnet ($publishArgs + @((Join-Path $rootDir "src\HanniGram.Server\HanniGram.Server.csproj"), "-o", $serverOut))
 Write-Step "Publicando HanniGram.Cli ($Runtime)"
 Invoke-Dotnet ($publishArgs + @((Join-Path $rootDir "src\HanniGram.Cli\HanniGram.Cli.csproj"), "-o", $cliOut))
+Write-Step "Publicando HanniGram.Mcp ($Runtime)"
+Invoke-Dotnet ($publishArgs + @((Join-Path $rootDir "src\HanniGram.Mcp\HanniGram.Mcp.csproj"), "-o", $mcpOut))
 
 $serverExe = Join-Path $serverOut "HanniGram.Server.exe"
 $cliExe = Join-Path $cliOut "HanniGram.Cli.exe"
+$mcpExe = Join-Path $mcpOut "HanniGram.Mcp.exe"
 $appSettings = Join-Path $serverOut "appsettings.json"
-foreach ($file in @($serverExe, $cliExe, $appSettings)) {
+foreach ($file in @($serverExe, $cliExe, $mcpExe, $appSettings)) {
     if (-not (Test-Path $file)) { throw "La publicacion no produjo $file" }
 }
 
 # ---------------------------------------------------------------------------
-# 2. Staging: daemon + CLI + pi-extension + docs
+# 2. Staging: daemon + CLI + MCP server + pi-extension + docs
 # ---------------------------------------------------------------------------
 Write-Step "Preparando el paquete"
 Copy-Item $serverExe (Join-Path $stageDir "HanniGram.Server.exe")
 Copy-Item $cliExe (Join-Path $stageDir "hannigram.exe")
+Copy-Item $mcpExe (Join-Path $stageDir "hannigram-mcp.exe")
 Copy-Item $appSettings (Join-Path $stageDir "appsettings.json")
 Copy-Item (Join-Path $rootDir "README.md") (Join-Path $stageDir "README-HanniGram.md")
 
@@ -117,6 +123,7 @@ $leeme = @(
     "",
     "- HanniGram.Server.exe  -> daemon HTTP (127.0.0.1:8765). Lo arranca HanniPI solo.",
     "- hannigram.exe         -> CLI (init/save/search/list/topics/...).",
+    "- hannigram-mcp.exe     -> servidor MCP por stdio (opcional, no se registra solo).",
     "- pi-extension/         -> extension del harness (tools mem_*).",
     "",
     "BD en %USERPROFILE%\.hannigram\hannigram.db",
@@ -165,6 +172,39 @@ if ($SkipSmokeTest) {
         $env:HANNIGRAM_URLS = $previousUrls
         if ($process -and -not $process.HasExited) { Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue }
     }
+}
+
+# ---------------------------------------------------------------------------
+# 3b. Smoke test: the packaged MCP server must complete initialize over stdio
+# ---------------------------------------------------------------------------
+if ($SkipSmokeTest) {
+    Write-Warn "smoke test MCP omitido (-SkipSmokeTest)"
+} elseif (-not $isWindowsHost) {
+    Write-Warn "smoke test MCP omitido: el binario $Runtime solo se ejecuta en Windows"
+} else {
+    Write-Step "Smoke test del servidor MCP empaquetado"
+    # El servidor abre su propia BD: se apunta a un archivo temporal para no tocar
+    # la BD real del usuario ni la que deje el smoke test del daemon.
+    $mcpSmokeDb = Join-Path $workRoot "mcp-smoke\hannigram.db"
+    New-Item -ItemType Directory -Path (Split-Path $mcpSmokeDb) -Force | Out-Null
+    $mcpStderrFile = Join-Path $workRoot "mcp-smoke-stderr.txt"
+    $previousMcpDb = $env:HANNIGRAM_DB
+    $env:HANNIGRAM_DB = $mcpSmokeDb
+    try {
+        $initLine = '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"smoke","version":"1"}}}'
+        $listLine = '{"jsonrpc":"2.0","id":2,"method":"tools/list"}'
+        # stdout es el canal de protocolo; stderr va a un archivo aparte y no se lee
+        # como respuesta.
+        $mcpStdout = @($initLine, $listLine) | & (Join-Path $stageDir "hannigram-mcp.exe") 2>$mcpStderrFile
+    } finally {
+        $env:HANNIGRAM_DB = $previousMcpDb
+    }
+    # Cada respuesta tiene que ser una linea JSON-RPC; la ausencia de framing
+    # correcto (o un throw) hace fallar el asset.
+    if (-not ($mcpStdout -match '"jsonrpc"')) {
+        throw "El servidor MCP empaquetado no respondio initialize (stdout: $($mcpStdout -join ' / '))"
+    }
+    Write-Ok "MCP OK (initialize + tools/list respondidos por stdio)"
 }
 
 # ---------------------------------------------------------------------------

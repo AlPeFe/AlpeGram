@@ -24,3 +24,6 @@ jobs:
 
       - name: Build
         run: dotnet build HanniGram.slnx -c Release --nologo
+
+      - name: Test
+        run: dotnet test HanniGram.slnx -c Release --nologo

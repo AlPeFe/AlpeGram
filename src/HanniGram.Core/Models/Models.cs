@@ -31,6 +31,21 @@ public sealed class Observation
     public string? Type { get; set; }
     public DateTime CreatedAtUtc { get; set; }
     public DateTime UpdatedAtUtc { get; set; }
+    /// <summary>
+    /// Lifecycle state: "active", "needs_review" or "archived". Default reads
+    /// only return "active"; archived is the safe forget.
+    /// </summary>
+    public string State { get; set; } = MemoryStates.Active;
+    /// <summary>
+    /// Pinned flag. Pinned global heuristics are the only global memory allowed
+    /// into the automatic context path (the bounded injection budget).
+    /// </summary>
+    public bool Pinned { get; set; }
+    /// <summary>
+    /// Origin scope ("project" or "global"). Lets a caller tell a repo fact
+    /// from a universal heuristic. Set on every read path.
+    /// </summary>
+    public string? Scope { get; set; }
 }
 
 /// <summary>
@@ -59,4 +74,95 @@ public sealed class SearchHit
     public string? Type { get; set; }
     public DateTime CreatedAtUtc { get; set; }
     public double Rank { get; set; }
+    /// <summary>
+    /// Lifecycle state of the hit. Only relevant when the search is asked for a
+    /// non-default state (a default search returns active rows only).
+    /// </summary>
+    public string? State { get; set; }
+    /// <summary>
+    /// Origin scope ("project" or "global") of the hit, so a cross-scope search
+    /// can distinguish a repo fact from a universal heuristic.
+    /// </summary>
+    public string? Scope { get; set; }
+}
+
+/// <summary>
+/// One namespace to include in a cross-scope read: a project id plus the origin
+/// label ("project" or "global") stamped onto every row it returns.
+/// </summary>
+public readonly record struct MemoryNamespace(long ProjectId, string Scope);
+
+/// <summary>
+/// The result of a promotion. <see cref="Outcome"/> is one of the bounded
+/// <see cref="PromotionOutcomes"/> tokens (<c>moved</c>, <c>merged</c>,
+/// <c>refused</c>). <see cref="Observation"/> is present for <c>moved</c> and
+/// <c>merged</c> and absent for <c>refused</c>; <see cref="Reason"/> is set only
+/// for <c>refused</c>. A not-found source is reported as a null result, not as a
+/// refusal.
+/// </summary>
+public sealed class PromotionResult
+{
+    public required string Outcome { get; init; }
+    public Observation? Observation { get; init; }
+    /// <summary>Machine-readable refusal reason (e.g. <c>source_archived</c>), or null.</summary>
+    public string? Reason { get; init; }
+}
+
+/// <summary>
+/// The compact review hint a save returns when it detected a collision. A few
+/// tokens only: the colliding id, its truncated title and the kind of collision.
+/// It is absent (null) when there is nothing to report. This is the entire
+/// review mechanism on the hot path — it never carries memory bodies.
+/// </summary>
+public sealed class SaveReviewHint
+{
+    /// <summary>"topic_key" (an upsert overwrote an existing keyed row) or "duplicate".</summary>
+    public required string Kind { get; set; }
+    /// <summary>The id of the row the save collided with.</summary>
+    public long Id { get; set; }
+    /// <summary>The colliding row's title, truncated to a few dozen characters.</summary>
+    public required string Title { get; set; }
+}
+
+/// <summary>
+/// One bounded entry of the review listing. Previews are truncated; the review
+/// response never returns an observation body.
+/// </summary>
+public sealed class ReviewItem
+{
+    /// <summary>"needs_review" or "duplicate".</summary>
+    public required string Kind { get; set; }
+    public long Id { get; set; }
+    public required string Title { get; set; }
+    public required string Preview { get; set; }
+    public string? State { get; set; }
+    public string? Scope { get; set; }
+    /// <summary>For a duplicate candidate, the id of the earlier row it duplicates.</summary>
+    public long? DuplicateOfId { get; set; }
+}
+
+/// <summary>
+/// One bounded entry of the automatic context path. The preview is truncated and
+/// the body is never included, so an injection paid on every request stays cheap.
+/// </summary>
+public sealed class ContextItem
+{
+    public long Id { get; set; }
+    public required string Title { get; set; }
+    public required string Preview { get; set; }
+    public string? TopicKey { get; set; }
+    public string? Type { get; set; }
+    public string? Scope { get; set; }
+    public bool Pinned { get; set; }
+}
+
+/// <summary>
+/// The bounded global injection surface: at most a small fixed number of pinned
+/// global heuristics plus a bounded number of recent project rows, previews only.
+/// The caps are store constants; a caller cannot raise them.
+/// </summary>
+public sealed class ContextSurface
+{
+    public IReadOnlyList<ContextItem> PinnedGlobal { get; set; } = Array.Empty<ContextItem>();
+    public IReadOnlyList<ContextItem> RecentProject { get; set; } = Array.Empty<ContextItem>();
 }
