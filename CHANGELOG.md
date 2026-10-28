@@ -7,6 +7,8 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [0.2.2] - 2026-10-28
+
 ### Added
 
 - **Second FTS index: `observations_fts_words` (`tokenize='porter unicode61'`) next to the trigram
