@@ -5,6 +5,21 @@ All notable changes to HanniGram are documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+
+- **Memory search relaxes `AND` to `OR` with bm25 ranking.** `HanniGramStore.Search` opened with a
+  strict all-terms query, so one absent word turned a good query into zero hits (the "AND trap") and
+  any paraphrase that shared no literal term returned nothing. The primary path is now an `OR` of the
+  query terms ranked by bm25 — which still favours rows that satisfy more (and rarer) terms — and the
+  trigram `OR`-of-grams fallback is kept as a second pass for typos and for the 1-2 character guard.
+  Measured on the 42-query / 35-observation bench: recall@1 0.600 -> 0.800, recall@5 0.600 -> 0.875,
+  semantic recall@5 0.000 -> 0.643, false-positive rate 0.000, p95 8.4 -> 6.9 ms. Trade-off to watch:
+  a query now returns a candidate list instead of one row, so `mem_search` payloads grow (~196 -> ~1399
+  bytes per query on the bench corpus). `mem_search`'s `query` description no longer promises
+  "all terms must match".
+
 ## [0.2.1] - 2026-10-15
 
 ### Fixed

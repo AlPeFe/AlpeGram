@@ -125,7 +125,8 @@ public sealed class SearchTests
         Assert.Equal(observation.Id, hit.Id);
     }
 
-    // The strict AND match on the misspelling "zephyruos" is empty, so the trigram
+    // The primary OR match on the misspelling "zephyruos" is empty (a quoted term
+    // is a phrase over trigrams, so it needs the exact substring), so the trigram
     // fallback runs. A typo *inside* one token must still match the intended row.
     [Fact]
     public void Search_TypoWithinAToken_StillMatchesViaTheFallback()
@@ -140,28 +141,30 @@ public sealed class SearchTests
         Assert.Contains("zephyrous", hit.Content);
     }
 
-    // "all query terms present" must survive the fallback: with "kwyjibo" absent
-    // from every document, no document may be returned even though "zephyrous" is
-    // present. Before the fix the fallback ORed every gram, so a present token
-    // dragged the hit in on its own.
+    // Relaxed (OR) primary path: "kwyjibo" is absent from every document, but the
+    // query still names a term that IS present, so the row comes back instead of
+    // the whole query collapsing to zero hits (the "AND trap" that made paraphrase
+    // recall 0.0 in the run-1 benchmark). The absent term must not invent matches
+    // of its own: asked alone, it returns nothing.
     [Fact]
-    public void Search_TwoTokensWhereTheSecondIsAbsent_ReturnsNothing()
+    public void Search_TwoTokensWhereTheSecondIsAbsent_StillReturnsTheMatchingRow()
     {
         using var db = new TempDatabase();
         using var store = db.OpenStore();
         var project = store.GetOrCreateProject("alpha");
-        store.SaveObservation(project.Id, "Generic title", "zephyrous payload");
+        var (observation, _) = store.SaveObservation(project.Id, "Generic title", "zephyrous payload");
 
-        Assert.Empty(store.Search(project.Id, "zephyrous kwyjibo"));
+        var hit = Assert.Single(store.Search(project.Id, "zephyrous kwyjibo"));
+
+        Assert.Equal(observation.Id, hit.Id);
+        Assert.Empty(store.Search(project.Id, "kwyjibo"));
     }
 
-    // The two words sit in different documents and the query asks for both, so the
-    // fallback must not merge their per-token gram groups cross-document. Before
-    // the fix the fallback ORed every gram, returning a hit for each document.
-    // The fixtures are gram-disjoint on purpose: with the per-token AND, a shared
-    // gram would let each document satisfy the other token's group (see T8 notes).
+    // With OR, two words that live in different documents each match their own row;
+    // bm25 decides the order. What must NOT happen is a row matching a term it does
+    // not contain, so each token alone still scopes to its own row.
     [Fact]
-    public void Search_TwoUnrelatedTokensInDifferentDocuments_DoNotMatchEachOther()
+    public void Search_TwoUnrelatedTokensInDifferentDocuments_EachMapsToItsOwnRow()
     {
         using var db = new TempDatabase();
         using var store = db.OpenStore();
@@ -169,6 +172,12 @@ public sealed class SearchTests
         store.SaveObservation(project.Id, "First", "obsidianwalnut");
         store.SaveObservation(project.Id, "Second", "geraniumposts");
 
-        Assert.Empty(store.Search(project.Id, "obsidianwalnut geraniumposts"));
+        var hits = store.Search(project.Id, "obsidianwalnut geraniumposts");
+
+        Assert.Equal(2, hits.Count);
+        Assert.Contains(hits, h => h.Content.Contains("obsidianwalnut"));
+        Assert.Contains(hits, h => h.Content.Contains("geraniumposts"));
+        Assert.Single(store.Search(project.Id, "obsidianwalnut"));
+        Assert.Single(store.Search(project.Id, "geraniumposts"));
     }
 }

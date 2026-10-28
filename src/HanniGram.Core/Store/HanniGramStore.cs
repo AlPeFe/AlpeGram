@@ -890,11 +890,16 @@ public sealed class HanniGramStore : IDisposable
             }
 
             var filter = ReadState(state);
+            // Primary path: OR of the terms ranked by bm25 (see FtsQuery). This is
+            // the relaxed-AND candidate set; bm25 orders it by how many terms — and
+            // how rare terms — each row satisfies.
             var hits = SearchCore(namespaces, ftsQuery, limit, type, topicKey, filter);
-            // Trigram tokenizer matches substrings, not fuzzy typos. When a strict
-            // AND match finds nothing, retry with OR of the query's trigrams so a
-            // typo'd word (1-3 chars off in a long word) still matches documents
-            // sharing enough trigrams, ranked by bm25.
+            // Second pass, kept on purpose: the trigram tokenizer matches substrings,
+            // not typos. When the phrase match finds nothing (a single misspelled
+            // token, or a query whose terms are all absent from the corpus), retry
+            // with OR of the query's trigrams per token so a typo'd word (1-3 chars
+            // off in a long word) still matches documents sharing enough trigrams,
+            // ranked by bm25.
             if (hits.Count == 0 && query.Where(char.IsLetterOrDigit).Count() >= 6)
             {
                 var fallback = FtsTrigramFallback(query);
@@ -1440,22 +1445,32 @@ public sealed class HanniGramStore : IDisposable
 
     private static string FtsQuery(string raw)
     {
-        // Escape FTS5 special chars and AND the terms so multi-word queries
-        // require all terms (closer to a focused search). Trigram tokenizer
-        // matches substrings of >=3 chars; drop 1-2-char terms (they would
-        // match nothing / could error) so a typo'd fragment still finds data.
+        // Escape FTS5 special chars and OR the terms. The AND version ("every term
+        // must be present") is the single biggest recall sink measured in the run-1
+        // benchmark: one absent word turned a good query into zero hits (the
+        // "AND trap"), and paraphrase queries never satisfied it at all. With OR,
+        // every document sharing at least one term stays in the candidate set and
+        // bm25 does the ordering: it sums one weighted contribution per matching
+        // term, so documents that satisfy more (and rarer) terms rank first, which
+        // recovers the focus AND was supposed to give without its zero-recall cliff.
+        // Trigram tokenizer matches substrings of >=3 chars; drop 1-2-char terms
+        // (they would match nothing / could error) so a typo'd fragment still finds
+        // data.
         var terms = QueryTokens(raw)
             .Where(t => t.Length >= TrigramLength)
             .Select(t => "\"" + t.Replace("\"", "\"\"") + "\"");
-        return string.Join(" AND ", terms);
+        return string.Join(" OR ", terms);
     }
 
     /// <summary>
-    /// Typo-tolerant fallback used only when the strict AND match is empty. It
-    /// keeps "all query terms must be present" semantics: each token contributes
-    /// its own OR-group of trigrams, and the token groups are ANDed together. A
-    /// typo inside one token still matches (its group shares enough grams), but a
-    /// token entirely absent cannot be satisfied by another token's grams.
+    /// Typo-tolerant second pass, used only when the primary OR match returns
+    /// nothing. It keeps "all query terms must be present" semantics: each token
+    /// contributes its own OR-group of trigrams, and the token groups are ANDed
+    /// together. A typo inside one token still matches (its group shares enough
+    /// grams), but a token entirely absent cannot be satisfied by another token's
+    /// grams. The per-token AND is what makes this pass safe on top of a relaxed
+    /// primary query: it can only ever narrow an already-empty result set, so it
+    /// cannot drag unrelated rows in.
     /// Trigrams are built per token — never across token boundaries — so no gram
     /// spans a space, and a HashSet keeps the dedup linear instead of quadratic.
     /// </summary>

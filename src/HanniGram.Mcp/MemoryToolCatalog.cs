@@ -112,7 +112,7 @@ public static class MemoryToolCatalog
             {
               "type": "object",
               "properties": {
-                "query": { "type": "string", "description": "Search terms; all terms must match." },
+                "query": { "type": "string", "description": "Search terms; any may match, best bm25 first." },
                 "limit": { "type": "integer", "description": "Max hits (default 10, hard cap 50)." },
                 "type": { "type": "string", "description": "Filter by observation type." },
                 "topicKey": { "type": "string", "description": "Restrict to one topic key." },
