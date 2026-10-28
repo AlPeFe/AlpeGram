@@ -1,9 +1,15 @@
 /**
  * HanniGram — native Pi extension.
  *
- * Registers the mem_* tools that talk to the HanniGram daemon over HTTP
+ * Registers the four mem_* tools that talk to the HanniGram daemon over HTTP
  * (default http://127.0.0.1:8765). No MCP: the harness consumes HanniGram
  * natively as tooling, exactly like any built-in Pi tool.
+ *
+ * The surface is deliberately four tools (SPEC-002): the memory layer used to
+ * cost 1,734 tokens of schema per turn across 14 tools, more than the whole
+ * harness. Consolidated into mem_search / mem_save / mem_get / mem_admin with
+ * terse descriptions and action/kind enums, the exact same behaviour costs
+ * ~680. Read paths are mem_get, writes are mem_save, maintenance is mem_admin.
  *
  * The daemon resolves the project from the session cwd (git remote when
  * available), so memory is scoped per project automatically.
@@ -111,6 +117,13 @@ function boundedObservation<T>(row: T): T {
 	return copy as T;
 }
 
+/** Heading line shared by every list rendering: `#12 [topic] Title`. */
+function heading(row: { id: number; title?: string; topicKey?: string; scope?: string }): string {
+	const origin = row.scope ? ` (${row.scope})` : "";
+	const topic = row.topicKey ? ` [${bound(row.topicKey, MAX_TOKEN_CHARS)}]` : "";
+	return `#${row.id}${origin} ${bound(row.title, MAX_TITLE_CHARS)}${topic}`;
+}
+
 function healthUrl(): string {
 	return `${baseUrl()}/health`;
 }
@@ -179,55 +192,83 @@ async function ensureDaemon(): Promise<void> {
 	}
 }
 
+/** Fields `mem_admin action=update` may patch (anything else is ignored). */
+const UPDATE_FIELDS = ["title", "content", "what", "why", "where", "learned", "topicKey", "type"] as const;
+
+/** Keep only the known, non-undefined update fields; "" still clears a field. */
+function pickFields(raw: Record<string, string> | undefined): Record<string, string> {
+	const out: Record<string, string> = {};
+	if (!raw) return out;
+	for (const field of UPDATE_FIELDS) {
+		const value = raw[field];
+		if (typeof value === "string") out[field] = value;
+	}
+	return out;
+}
+
+/** Shorthand result: one text part, details echoed back for callers. */
+function result(text: string, details: unknown) {
+	return { content: [{ type: "text" as const, text }], details };
+}
+
 export default function (pi: ExtensionAPI) {
 	// Hanni owns HanniGram: bring the daemon up as soon as the extension loads.
 	void ensureDaemon();
 
 	// ------------------------------------------------------------------
-	// mem_current_project — confirm the resolved project
+	// mem_search — the entry point for reading memory
 	// ------------------------------------------------------------------
 	pi.registerTool({
-		name: "mem_current_project",
-		label: "HanniGram: current project",
-		description:
-			"Confirm the HanniGram project resolved for the current working directory (git remote when available). Call this first to orient before reading or writing memory.",
-		parameters: Type.Object({}),
-		execute: async (_id, _params, _signal, _onUpdate, ctx: ExtensionToolContext) => {
+		name: "mem_search",
+		label: "HanniGram: search memory",
+		description: "Search project and global memory; hits are previews.",
+		parameters: Type.Object({
+			query: Type.String({ description: "Terms; bm25-ranked, not all required" }),
+			limit: Type.Optional(Type.Number({ description: "Default 10" })),
+			type: Type.Optional(Type.String({ description: "adr | discovery | pattern | bugfix" })),
+			topicKey: Type.Optional(Type.String({ description: "One topic key" })),
+			scope: Type.Optional(
+				Type.String({ description: "Namespaces (default all)", enum: ["project", "global", "all"] }),
+			),
+		}),
+		execute: async (_id, params, _signal, _onUpdate, ctx: ExtensionToolContext) => {
 			await ensureDaemon();
-			const p = await api<{ id: number; name: string; rootPath?: string }>(
-				`/api/projects/current?${scope(ctx.cwd)}`,
+			const hits = await api<
+				Array<{ id: number; title: string; content: string; topicKey?: string; type?: string; scope?: string }>
+			>(
+				`/api/search?${scope(ctx.cwd, {
+					q: params.query,
+					limit: String(params.limit ?? 10),
+					scope: params.scope ?? "all",
+					...(params.type ? { type: params.type } : {}),
+					...(params.topicKey ? { topicKey: params.topicKey } : {}),
+				})}`,
 			);
-			return {
-				content: [{ type: "text", text: `Project: ${p.name}${p.rootPath ? ` (${p.rootPath})` : ""}` }],
-				details: p,
-			};
+			if (hits.length === 0) return result("No memory matches.", []);
+			const text = hits.map((h) => `${heading(h)}\n  ${bound(h.content)}`).join("\n");
+			return result(text, hits.map(boundedObservation));
 		},
 	});
 
 	// ------------------------------------------------------------------
-	// mem_save — save a durable observation
+	// mem_save — the entry point for writing memory
 	// ------------------------------------------------------------------
 	pi.registerTool({
 		name: "mem_save",
 		label: "HanniGram: save memory",
-		description:
-			"Save a durable, structured memory observation for the CURRENT project (scoped by git remote). Two kinds of memory: (1) decisions & conventions the agent must RESPECT — set type='adr' so they are always surfaced to the agent; (2) context/ideas in progress — discoveries, patterns, bugfixes, config, concepts being worked on (any other type). Set scope='global' only for a heuristic that repeats across many projects. Capture durable knowledge, never raw tool output or every turn. Give a short searchable title.",
+		description: "Save a memory; reusing a topicKey updates that topic's row.",
 		parameters: Type.Object({
-			title: Type.String({ description: "Short, searchable title of the observation" }),
-			content: Type.String({ description: "The full observation content" }),
+			title: Type.String({ description: "Short, searchable title" }),
+			content: Type.String({ description: "The observation" }),
 			what: Type.Optional(Type.String({ description: "What was done" })),
-			why: Type.Optional(Type.String({ description: "Why it was done" })),
-			where: Type.Optional(Type.String({ description: "Where (file/module) it applies" })),
-			learned: Type.Optional(Type.String({ description: "The lesson or takeaway" })),
-			topicKey: Type.Optional(
-				Type.String({ description: "Stable topic key, e.g. 'architecture/auth-model'. Reuse to update an evolving topic." }),
-			),
+			why: Type.Optional(Type.String({ description: "Why" })),
+			where: Type.Optional(Type.String({ description: "File or module" })),
+			learned: Type.Optional(Type.String({ description: "Takeaway" })),
+			topicKey: Type.Optional(Type.String({ description: "Stable key, e.g. architecture/auth-model" })),
 			type: Type.Optional(
-				Type.String({ description: "Observation type. Two buckets per project: 'adr' = decision/convention the agent must respect (always surfaced); anything else ('discovery', 'idea', 'pattern', 'bugfix', ...) = context/idea being worked on." }),
+				Type.String({ description: "adr = always-surfaced decision; else discovery | pattern | bugfix" }),
 			),
-			scope: Type.Optional(
-				Type.String({ description: "Where to write: 'project' (default, this repo) or 'global' (shared by every project)." }),
-			),
+			scope: Type.Optional(Type.String({ description: "Default project", enum: ["project", "global"] })),
 		}),
 		execute: async (_id, params, _signal, _onUpdate, ctx: ExtensionToolContext) => {
 			await ensureDaemon();
@@ -250,424 +291,256 @@ export default function (pi: ExtensionAPI) {
 			// The daemon's compact review hint (a few tokens, never a body) tells the
 			// model the save collided with something it may now want to review.
 			const hint = review ? `\nreview: ${review.kind} #${review.id} ${review.title}` : "";
-			return {
-				content: [
-					{
-						type: "text",
-						text: `${created ? "Saved" : "Updated"} observation #${obs.id} (${res.scope}): ${bound(obs.title, MAX_TITLE_CHARS)}${obs.topicKey ? ` [topic: ${bound(obs.topicKey, MAX_TOKEN_CHARS)}]` : ""}${hint}`,
-					},
-				],
-				details: boundedObservation(obs),
-			};
-		},
-	});
-
-	// ------------------------------------------------------------------
-	// mem_delete — delete an observation
-	// ------------------------------------------------------------------
-	pi.registerTool({
-		name: "mem_delete",
-		label: "HanniGram: delete memory",
-		description:
-			"Delete a memory observation by id from the current project (or the shared global memory with scope='global'). Use to remove stale, wrong, or superseded observations. Returns whether it was deleted.",
-		parameters: Type.Object({
-			id: Type.Number({ description: "Observation id to delete" }),
-			scope: Type.Optional(
-				Type.String({ description: "Namespace that owns the row: 'project' (default) or 'global'." }),
-			),
-		}),
-		execute: async (_id, params, _signal, _onUpdate, ctx: ExtensionToolContext) => {
-			await ensureDaemon();
-			const { id, scope: rowScope } = params;
-			const url = `${baseUrl()}/api/observations/${id}?${scope(ctx.cwd, rowScope ? { scope: rowScope } : {})}`;
-			const res = await fetch(url, { method: "DELETE" });
-			if (res.status === 404) {
-				ctx.ui.notify(`✗ Memoria #${id} no encontrada`, "warning");
-				return { content: [{ type: "text", text: `Observation #${id} not found.` }], details: { deleted: false } };
-			}
-			if (!res.ok) {
-				const body = await res.text().catch(() => "");
-				throw new Error(`HanniGram ${res.status}: ${body || res.statusText}`);
-			}
-			ctx.ui.notify(`✓ Memoria eliminada #${id}`, "info");
-			return { content: [{ type: "text", text: `Deleted observation #${id}.` }], details: { deleted: true, id } };
-		},
-	});
-
-	// ------------------------------------------------------------------
-	// mem_search — full-text search over project memory
-	// ------------------------------------------------------------------
-	pi.registerTool({
-		name: "mem_search",
-		label: "HanniGram: search memory",
-		description:
-			"Full-text search over memory (SQLite FTS5). scope='all' (default) covers the project and the shared global memory, and every hit shows its origin. Use before revisiting a decision, bug, convention, or request that may already be known. Results are previews, not the complete record.",
-		parameters: Type.Object({
-			query: Type.String({ description: "Search terms; all terms must match" }),
-			limit: Type.Optional(Type.Number({ description: "Max results (default 10)" })),
-			type: Type.Optional(Type.String({ description: "Filter by observation type (e.g. 'adr', 'decision', 'bugfix', 'pattern')" })),
-			topicKey: Type.Optional(Type.String({ description: "Restrict to a single topic key, e.g. 'ui/palette'" })),
-			scope: Type.Optional(
-				Type.String({ description: "Namespaces to search: 'project', 'global', or 'all' (default). Each hit is labelled with its origin." }),
-			),
-		}),
-		execute: async (_id, params, _signal, _onUpdate, ctx: ExtensionToolContext) => {
-			await ensureDaemon();
-			const hits = await api<
-				Array<{ id: number; title: string; content: string; topicKey?: string; type?: string; scope?: string }>
-			>(
-				`/api/search?${scope(ctx.cwd, {
-					q: params.query,
-					limit: String(params.limit ?? 10),
-					scope: params.scope ?? "all",
-					...(params.type ? { type: params.type } : {}),
-					...(params.topicKey ? { topicKey: params.topicKey } : {}),
-				})}`,
+			return result(
+				`${created ? "Saved" : "Updated"} observation #${obs.id} (${res.scope}): ${bound(obs.title, MAX_TITLE_CHARS)}${obs.topicKey ? ` [topic: ${bound(obs.topicKey, MAX_TOKEN_CHARS)}]` : ""}${hint}`,
+				boundedObservation(obs),
 			);
-			if (hits.length === 0) {
-				return { content: [{ type: "text", text: "No memory matches." }], details: [] };
-			}
-			const text = hits
-				.map((h) => `#${h.id} (${h.scope ?? "project"}) ${bound(h.title, MAX_TITLE_CHARS)}${h.topicKey ? ` [${bound(h.topicKey, MAX_TOKEN_CHARS)}]` : ""}\n  ${bound(h.content)}`)
-				.join("\n");
-			return { content: [{ type: "text", text }], details: hits.map(boundedObservation) };
 		},
 	});
 
 	// ------------------------------------------------------------------
-	// mem_context — recent observations for the project
+	// mem_get — every read path, selected by kind
 	// ------------------------------------------------------------------
 	pi.registerTool({
-		name: "mem_context",
-		label: "HanniGram: recent memory context",
-		description:
-			"Return the most recent observations for the current project. Use at the start of related work to recover relevant history before continuing.",
+		name: "mem_get",
+		label: "HanniGram: read memory",
+		description: "Read memory: a row, recent context, a topic, or the project.",
 		parameters: Type.Object({
-			limit: Type.Optional(Type.Number({ description: "Max observations (default 20)" })),
+			kind: Type.String({ description: "Default id", enum: ["id", "context", "topic", "project"] }),
+			id: Type.Optional(Type.Number({ description: "kind=id" })),
+			topicKey: Type.Optional(Type.String({ description: "kind=topic" })),
+			limit: Type.Optional(Type.Number({ description: "kind=context cap (default 20)" })),
 		}),
 		execute: async (_id, params, _signal, _onUpdate, ctx: ExtensionToolContext) => {
 			await ensureDaemon();
+			const kind = params.kind ?? "id";
+
+			if (kind === "project") {
+				const p = await api<{ id: number; name: string; rootPath?: string }>(`/api/projects/current?${scope(ctx.cwd)}`);
+				return result(`Project: ${p.name}${p.rootPath ? ` (${p.rootPath})` : ""}`, p);
+			}
+
+			if (kind === "id") {
+				if (params.id === undefined) return result("kind=id needs an id.", {});
+				const obs = await apiOrMissing<Record<string, unknown>>(`/api/observations/${params.id}?${scope(ctx.cwd)}`);
+				if (!obs) return result(`Observation #${params.id} not found.`, { found: false });
+				const bounded = boundedObservation(obs);
+				// Bounded rendering: a raw JSON.stringify used to hand the model a whole
+				// 6000-character body. Every field goes through the same budget.
+				const lines = [heading(bounded as { id: number })];
+				if (bounded.type) lines.push(`type: ${bound(bounded.type, MAX_TOKEN_CHARS)}`);
+				if (bounded.state) lines.push(`state: ${bounded.state}`);
+				lines.push(bound(bounded.content));
+				for (const field of CONTENT_FIELDS) {
+					if (field === "content") continue;
+					if (bounded[field]) lines.push(`${field}: ${bound(bounded[field])}`);
+				}
+				return result(lines.join("\n"), bounded);
+			}
+
+			if (kind === "topic") {
+				if (!params.topicKey) return result("kind=topic needs a topicKey.", []);
+				// The canonical by-key lookup is a QUERY parameter: a slash key
+				// ("architecture/auth-model") survives URL-encoding exactly, unlike a path
+				// segment, which used to come back as a silent empty list.
+				const obs = await api<Array<{ id: number; title: string; content: string; topicKey?: string }>>(
+					`/api/observations/topic?${scope(ctx.cwd, { topicKey: params.topicKey })}`,
+				);
+				if (obs.length === 0) return result(`No observations for topic '${params.topicKey}'.`, []);
+				const text = obs.map((o) => `${heading(o)}\n  ${bound(o.content)}`).join("\n");
+				return result(text, obs.map(boundedObservation));
+			}
+
 			const obs = await api<Array<{ id: number; title: string; content: string; topicKey?: string; type?: string }>>(
 				`/api/observations?${scope(ctx.cwd, { limit: String(params.limit ?? 20) })}`,
 			);
-			if (obs.length === 0) {
-				return { content: [{ type: "text", text: "No memory yet for this project." }], details: [] };
-			}
-			const text = obs
-				.map((o) => `#${o.id} ${bound(o.title, MAX_TITLE_CHARS)}${o.topicKey ? ` [${bound(o.topicKey, MAX_TOKEN_CHARS)}]` : ""}\n  ${bound(o.content)}`)
-				.join("\n");
-			return { content: [{ type: "text", text }], details: obs.map(boundedObservation) };
+			if (obs.length === 0) return result("No memory yet for this project.", []);
+			const text = obs.map((o) => `${heading(o)}\n  ${bound(o.content)}`).join("\n");
+			return result(text, obs.map(boundedObservation));
 		},
 	});
 
 	// ------------------------------------------------------------------
-	// mem_timeline — observations by topic key
+	// mem_admin — maintenance only: nothing here reads a full body
 	// ------------------------------------------------------------------
 	pi.registerTool({
-		name: "mem_timeline",
-		label: "HanniGram: memory timeline by topic",
-		description:
-			"Return all observations for a given topic key in the current project, newest first. Use when surrounding session context matters for an evolving topic.",
+		name: "mem_admin",
+		label: "HanniGram: maintain memory",
+		description: "Maintain existing memory: lifecycle, edits, promotion, review, handoff.",
 		parameters: Type.Object({
-			topicKey: Type.String({ description: "The topic key to retrieve, e.g. 'architecture/auth-model'" }),
-		}),
-		execute: async (_id, params, _signal, _onUpdate, ctx: ExtensionToolContext) => {
-			await ensureDaemon();
-			// The canonical by-key lookup is a QUERY parameter: a slash key
-			// ("architecture/auth-model") survives URL-encoding exactly, unlike a path
-			// segment, which used to come back as a silent empty list.
-			const obs = await api<Array<{ id: number; title: string; content: string; topicKey?: string }>>(
-				`/api/observations/topic?${scope(ctx.cwd, { topicKey: params.topicKey })}`,
-			);
-			if (obs.length === 0) {
-				return { content: [{ type: "text", text: `No observations for topic '${params.topicKey}'.` }], details: [] };
-			}
-			const text = obs
-				.map((o) => `#${o.id} ${bound(o.title, MAX_TITLE_CHARS)}\n  ${bound(o.content)}`)
-				.join("\n");
-			return { content: [{ type: "text", text }], details: obs.map(boundedObservation) };
-		},
-	});
-
-	// ------------------------------------------------------------------
-	// mem_get_observation — full detail of one observation
-	// ------------------------------------------------------------------
-	pi.registerTool({
-		name: "mem_get_observation",
-		label: "HanniGram: get observation",
-		description: "Return the full detail of a single observation by id, before relying on it.",
-		parameters: Type.Object({
-			id: Type.Number({ description: "Observation id" }),
-		}),
-		execute: async (_id, params, _signal, _onUpdate, ctx: ExtensionToolContext) => {
-			await ensureDaemon();
-			const obs = await api<Record<string, unknown>>(`/api/observations/${params.id}?${scope(ctx.cwd)}`);
-			const bounded = boundedObservation(obs);
-			// Bounded rendering: the previous raw JSON.stringify could hand the model a
-			// whole 6000-character body. Every field now goes through the same budget.
-			const lines = [`#${bounded.id} ${bound(bounded.title, MAX_TITLE_CHARS)}`];
-			if (bounded.topicKey) lines.push(`topic: ${bound(bounded.topicKey, MAX_TOKEN_CHARS)}`);
-			if (bounded.type) lines.push(`type: ${bound(bounded.type, MAX_TOKEN_CHARS)}`);
-			if (bounded.state) lines.push(`state: ${bounded.state}`);
-			lines.push(bound(bounded.content));
-			for (const field of CONTENT_FIELDS) {
-				if (field === "content") continue;
-				if (bounded[field]) lines.push(`${field}: ${bound(bounded[field])}`);
-			}
-			return { content: [{ type: "text", text: lines.join("\n") }], details: bounded };
-		},
-	});
-
-	// ------------------------------------------------------------------
-	// mem_suggest_topic_key — existing topic keys
-	// ------------------------------------------------------------------
-	pi.registerTool({
-		name: "mem_suggest_topic_key",
-		label: "HanniGram: suggest topic keys",
-		description:
-			"List existing topic keys in the current project. Use when unsure of the stable topic_key to reuse for an evolving topic.",
-		parameters: Type.Object({}),
-		execute: async (_id, _params, _signal, _onUpdate, ctx: ExtensionToolContext) => {
-			await ensureDaemon();
-			const topics = await api<string[]>(`/api/topics?${scope(ctx.cwd)}`);
-			if (topics.length === 0) {
-				return { content: [{ type: "text", text: "No topic keys yet." }], details: [] };
-			}
-			return { content: [{ type: "text", text: topics.join("\n") }], details: topics };
-		},
-	});
-
-	// ------------------------------------------------------------------
-	// mem_session_summary — handoff at session end
-	// ------------------------------------------------------------------
-	pi.registerTool({
-		name: "mem_session_summary",
-		label: "HanniGram: session summary",
-		description:
-			"Save a session handoff summary for the current project: goal, discoveries, accomplished work, next steps. Call before ending a session so the next session can recover context.",
-		parameters: Type.Object({
-			summary: Type.String({ description: "Summary of what was accomplished and discovered" }),
-			goal: Type.Optional(Type.String({ description: "The session goal" })),
-			nextSteps: Type.Optional(Type.String({ description: "Next steps for the following session" })),
-			sessionId: Type.Optional(Type.String({ description: "Session id; a new one is created if omitted" })),
-		}),
-		execute: async (_id, params, _signal, _onUpdate, ctx: ExtensionToolContext) => {
-			await ensureDaemon();
-			const sessionId = params.sessionId ?? `pi-${Date.now().toString(36)}`;
-			await api(`/api/sessions/start?${scope(ctx.cwd)}`, {
-				method: "POST",
-				body: JSON.stringify({ sessionId }),
-			});
-			await api(`/api/sessions/end?${scope(ctx.cwd)}`, {
-				method: "POST",
-				body: JSON.stringify({
-					sessionId,
-					summary: params.summary,
-					goal: params.goal,
-					nextSteps: params.nextSteps,
+			action: Type.String({
+				description: "Operation",
+				enum: ["state", "pin", "promote", "update", "delete", "review", "session_summary", "suggest_topic_key"],
+			}),
+			id: Type.Optional(Type.Number({ description: "state | pin | promote | update | delete" })),
+			scope: Type.Optional(Type.String({ description: "Default project", enum: ["project", "global"] })),
+			state: Type.Optional(Type.String({ description: "action=state", enum: ["active", "needs_review", "archived"] })),
+			pinned: Type.Optional(Type.Boolean({ description: "action=pin" })),
+			fields: Type.Optional(
+				Type.Record(Type.String(), Type.String(), {
+					description: "action=update: title, content, what, why, where, learned, topicKey, type; partial",
 				}),
-			});
-			ctx.ui.notify(`✓ Resumen de sesión guardado (${sessionId})`, "info");
-			return {
-				content: [{ type: "text", text: `Session ${sessionId} summary saved.` }],
-				details: { sessionId },
-			};
-		},
-	});
-
-	// ------------------------------------------------------------------
-	// mem_update — edit an observation in place
-	// ------------------------------------------------------------------
-	pi.registerTool({
-		name: "mem_update",
-		label: "HanniGram: update memory",
-		description:
-			"Edit an existing observation by id. Only the fields you pass change; an empty string clears one. Use it to correct or extend memory instead of saving a near-duplicate.",
-		parameters: Type.Object({
-			id: Type.Number({ description: "Observation id" }),
-			title: Type.Optional(Type.String({ description: "New title" })),
-			content: Type.Optional(Type.String({ description: "New content" })),
-			what: Type.Optional(Type.String({ description: "New 'what'; empty string clears it" })),
-			why: Type.Optional(Type.String({ description: "New 'why'; empty string clears it" })),
-			where: Type.Optional(Type.String({ description: "New 'where'; empty string clears it" })),
-			learned: Type.Optional(Type.String({ description: "New 'learned'; empty string clears it" })),
-			topicKey: Type.Optional(Type.String({ description: "New topic key; empty string clears it" })),
-			type: Type.Optional(Type.String({ description: "New type; empty string clears it" })),
-			scope: Type.Optional(
-				Type.String({ description: "Namespace that owns the row: 'project' (default) or 'global'." }),
 			),
+			allowArchived: Type.Optional(Type.Boolean({ description: "action=promote" })),
+			summary: Type.Optional(Type.String({ description: "action=session_summary" })),
+			goal: Type.Optional(Type.String()),
+			nextSteps: Type.Optional(Type.String()),
+			sessionId: Type.Optional(Type.String()),
+			limit: Type.Optional(Type.Number({ description: "review | suggest_topic_key cap" })),
 		}),
 		execute: async (_id, params, _signal, _onUpdate, ctx: ExtensionToolContext) => {
 			await ensureDaemon();
-			const { id, scope: rowScope, ...fields } = params;
-			const obs = await apiOrMissing<{ id: number; title: string; state?: string }>(
-				`/api/observations/${id}?${scope(ctx.cwd, rowScope ? { scope: rowScope } : {})}`,
-				{ method: "PUT", body: JSON.stringify(fields) },
-			);
-			if (!obs) {
+			const { action, id, scope: rowScope } = params;
+			const namespaced = (extra: Record<string, string> = {}) => scope(ctx.cwd, rowScope ? { scope: rowScope, ...extra } : extra);
+
+			/** Actions that mutate one existing row need one; a miss is a result, not a throw. */
+			const needsId = () => {
+				if (id === undefined) return result(`action=${action} needs an id.`, { ok: false });
+				return null;
+			};
+			const missingRow = (verb: string) => {
 				ctx.ui.notify(`✗ Memoria #${id} no encontrada`, "warning");
-				return { content: [{ type: "text", text: `Observation #${id} not found.` }], details: { updated: false } };
-			}
-			ctx.ui.notify(`✎ Memoria actualizada #${obs.id}: ${obs.title}`, "info");
-			return { content: [{ type: "text", text: `Updated observation #${obs.id}: ${bound(obs.title, MAX_TITLE_CHARS)}` }], details: boundedObservation(obs) };
-		},
-	});
-
-	// ------------------------------------------------------------------
-	// mem_review — bounded review listing
-	// ------------------------------------------------------------------
-	pi.registerTool({
-		name: "mem_review",
-		label: "HanniGram: review memory",
-		description:
-			"List memory that needs attention: rows flagged needs_review plus near-duplicate candidates, with truncated previews. Follow up with mem_update, mem_state or mem_delete.",
-		parameters: Type.Object({
-			limit: Type.Optional(Type.Number({ description: "Max items (default 20)" })),
-			scope: Type.Optional(
-				Type.String({ description: "Namespaces to review: 'project', 'global', or 'all' (default)." }),
-			),
-		}),
-		execute: async (_id, params, _signal, _onUpdate, ctx: ExtensionToolContext) => {
-			await ensureDaemon();
-			const items = await api<
-				Array<{ kind: string; id: number; scope?: string; title: string; preview: string; duplicateOfId?: number }>
-			>(
-				`/api/review?${scope(ctx.cwd, {
-					limit: String(params.limit ?? 20),
-					...(params.scope ? { scope: params.scope } : {}),
-				})}`,
-			);
-			if (items.length === 0) {
-				return { content: [{ type: "text", text: "Nothing to review." }], details: [] };
-			}
-			const text = items
-				.map(
-					(i) =>
-						`[${i.kind}] #${i.id} (${i.scope ?? "project"}) ${i.title}`
-						+ (i.duplicateOfId ? ` ~ duplicate of #${i.duplicateOfId}` : "")
-						+ `\n  ${i.preview}`,
-				)
-				.join("\n");
-			return { content: [{ type: "text", text }], details: items };
-		},
-	});
-
-	// ------------------------------------------------------------------
-	// mem_promote — promote a project memory to the global scope
-	// ------------------------------------------------------------------
-	pi.registerTool({
-		name: "mem_promote",
-		label: "HanniGram: promote memory",
-		description:
-			"Promote a project observation to the shared global memory when the lesson turned out to repeat across projects. If the topic key already exists globally, the promoted content overwrites that row. An archived row is refused unless allowArchived=true (the promoted row then stays archived).",
-		parameters: Type.Object({
-			id: Type.Number({ description: "Observation id in the current project" }),
-			allowArchived: Type.Optional(
-				Type.Boolean({ description: "Promote even when the row is archived. The promoted row stays archived; default false refuses." }),
-			),
-		}),
-		execute: async (_id, params, _signal, _onUpdate, ctx: ExtensionToolContext) => {
-			await ensureDaemon();
-			const query = scope(ctx.cwd, params.allowArchived ? { allowArchived: "true" } : {});
-			const res = await fetch(`${baseUrl()}/api/observations/${params.id}/promote?${query}`, { method: "POST" });
-			if (res.status === 404) {
-				ctx.ui.notify(`✗ Memoria #${params.id} no encontrada`, "warning");
-				return { content: [{ type: "text", text: `Observation #${params.id} not found.` }], details: { promoted: false } };
-			}
-			const body = (await res.json().catch(() => ({}))) as {
-				observation?: { id: number; title: string };
-				merged?: boolean;
-				outcome?: string;
-				reason?: string;
+				return result(`Observation #${id} not found.`, { [verb]: false });
 			};
-			if (res.status === 409) {
-				// A refusal is a result the model can act on (retry with allowArchived),
-				// not a thrown error.
-				ctx.ui.notify(`✗ Memoria #${params.id} archivada: promoción rechazada`, "warning");
-				return {
-					content: [
-						{
-							type: "text",
-							text: `Promotion refused (${body.reason ?? "refused"}): observation #${params.id} is archived. Pass allowArchived=true to promote it anyway; the promoted row stays archived.`,
-						},
-					],
-					details: body,
-				};
-			}
-			if (!res.ok) {
-				throw new Error(`HanniGram ${res.status}: ${JSON.stringify(body) || res.statusText}`);
-			}
-			const promoted = body.observation!;
-			ctx.ui.notify(`✓ Memoria promovida #${promoted.id} → global (${body.outcome})`, "info");
-			return {
-				content: [
-					{
-						type: "text",
-						text: `Promoted #${promoted.id} to global (${body.outcome}): ${bound(promoted.title, MAX_TITLE_CHARS)}`,
-					},
-				],
-				details: body,
-			};
-		},
-	});
 
-	// ------------------------------------------------------------------
-	// mem_state — lifecycle state
-	// ------------------------------------------------------------------
-	pi.registerTool({
-		name: "mem_state",
-		label: "HanniGram: set lifecycle state",
-		description:
-			"Set an observation's lifecycle state: 'active', 'needs_review' or 'archived'. Archiving is the safe forget — the row is kept but excluded from default reads.",
-		parameters: Type.Object({
-			id: Type.Number({ description: "Observation id" }),
-			state: Type.String({ description: "New state: 'active', 'needs_review' or 'archived'" }),
-			scope: Type.Optional(
-				Type.String({ description: "Namespace that owns the row: 'project' (default) or 'global'." }),
-			),
-		}),
-		execute: async (_id, params, _signal, _onUpdate, ctx: ExtensionToolContext) => {
-			await ensureDaemon();
-			const obs = await apiOrMissing<{ id: number; title: string; state: string }>(
-				`/api/observations/${params.id}/state?${scope(ctx.cwd, params.scope ? { scope: params.scope } : {})}`,
-				{ method: "POST", body: JSON.stringify({ state: params.state }) },
-			);
-			if (!obs) {
-				ctx.ui.notify(`✗ Memoria #${params.id} no encontrada o estado inválido`, "warning");
-				return { content: [{ type: "text", text: `Observation #${params.id} not found.` }], details: { updated: false } };
-			}
-			ctx.ui.notify(`✓ Memoria #${obs.id} → ${obs.state}`, "info");
-			return { content: [{ type: "text", text: `Observation #${obs.id} state: ${obs.state}` }], details: boundedObservation(obs) };
-		},
-	});
+			switch (action) {
+				case "state": {
+					if (!params.state) return result("action=state needs state.", { ok: false });
+					const guard = needsId();
+					if (guard) return guard;
+					const obs = await apiOrMissing<{ id: number; title: string; state: string }>(
+						`/api/observations/${id}/state?${namespaced()}`,
+						{ method: "POST", body: JSON.stringify({ state: params.state }) },
+					);
+					if (!obs) {
+						ctx.ui.notify(`✗ Memoria #${id} no encontrada o estado inválido`, "warning");
+						return result(`Observation #${id} not found.`, { updated: false });
+					}
+					ctx.ui.notify(`✓ Memoria #${obs.id} → ${obs.state}`, "info");
+					return result(`Observation #${obs.id} state: ${obs.state}`, boundedObservation(obs));
+				}
 
-	// ------------------------------------------------------------------
-	// mem_pin — pin / unpin an observation
-	// ------------------------------------------------------------------
-	pi.registerTool({
-		name: "mem_pin",
-		label: "HanniGram: pin memory",
-		description:
-			"Pin or unpin an observation. Pinned global heuristics are the only global memory that enters the automatic context budget (at most 3).",
-		parameters: Type.Object({
-			id: Type.Number({ description: "Observation id" }),
-			pinned: Type.Boolean({ description: "true to pin, false to unpin" }),
-			scope: Type.Optional(
-				Type.String({ description: "Namespace that owns the row: 'project' (default) or 'global'." }),
-			),
-		}),
-		execute: async (_id, params, _signal, _onUpdate, ctx: ExtensionToolContext) => {
-			await ensureDaemon();
-			const obs = await apiOrMissing<{ id: number; title: string; pinned: boolean }>(
-				`/api/observations/${params.id}/pin?${scope(ctx.cwd, params.scope ? { scope: params.scope } : {})}`,
-				{ method: "POST", body: JSON.stringify({ pinned: params.pinned }) },
-			);
-			if (!obs) {
-				ctx.ui.notify(`✗ Memoria #${params.id} no encontrada`, "warning");
-				return { content: [{ type: "text", text: `Observation #${params.id} not found.` }], details: { updated: false } };
+				case "pin": {
+					const guard = needsId();
+					if (guard) return guard;
+					const obs = await apiOrMissing<{ id: number; title: string; pinned: boolean }>(
+						`/api/observations/${id}/pin?${namespaced()}`,
+						{ method: "POST", body: JSON.stringify({ pinned: params.pinned ?? true }) },
+					);
+					if (!obs) return missingRow("updated");
+					ctx.ui.notify(`✓ Memoria #${obs.id} pinned=${obs.pinned}`, "info");
+					return result(`Observation #${obs.id} pinned: ${obs.pinned}`, boundedObservation(obs));
+				}
+
+				case "promote": {
+					const guard = needsId();
+					if (guard) return guard;
+					const res = await fetch(
+						`${baseUrl()}/api/observations/${id}/promote?${namespaced(params.allowArchived ? { allowArchived: "true" } : {})}`,
+						{ method: "POST" },
+					);
+					if (res.status === 404) return missingRow("promoted");
+					const body = (await res.json().catch(() => ({}))) as {
+						observation?: { id: number; title: string };
+						merged?: boolean;
+						outcome?: string;
+						reason?: string;
+					};
+					if (res.status === 409) {
+						// A refusal is a result the model can act on (retry with allowArchived),
+						// not a thrown error.
+						ctx.ui.notify(`✗ Memoria #${id} archivada: promoción rechazada`, "warning");
+						return result(
+							`Promotion refused (${body.reason ?? "refused"}): observation #${id} is archived. Pass allowArchived=true to promote it anyway; the promoted row stays archived.`,
+							body,
+						);
+					}
+					if (!res.ok) throw new Error(`HanniGram ${res.status}: ${JSON.stringify(body) || res.statusText}`);
+					const promoted = body.observation!;
+					ctx.ui.notify(`✓ Memoria promovida #${promoted.id} → global (${body.outcome})`, "info");
+					return result(
+						`Promoted #${promoted.id} to global (${body.outcome}): ${bound(promoted.title, MAX_TITLE_CHARS)}`,
+						body,
+					);
+				}
+
+				case "update": {
+					const guard = needsId();
+					if (guard) return guard;
+					const fields = pickFields(params.fields);
+					if (Object.keys(fields).length === 0) return result("action=update needs fields.", { updated: false });
+					const obs = await apiOrMissing<{ id: number; title: string; state?: string }>(
+						`/api/observations/${id}?${namespaced()}`,
+						{ method: "PUT", body: JSON.stringify(fields) },
+					);
+					if (!obs) return missingRow("updated");
+					ctx.ui.notify(`✎ Memoria actualizada #${obs.id}: ${obs.title}`, "info");
+					return result(`Updated observation #${obs.id}: ${bound(obs.title, MAX_TITLE_CHARS)}`, boundedObservation(obs));
+				}
+
+				case "delete": {
+					const guard = needsId();
+					if (guard) return guard;
+					const res = await fetch(`${baseUrl()}/api/observations/${id}?${namespaced()}`, { method: "DELETE" });
+					if (res.status === 404) return missingRow("deleted");
+					if (!res.ok) {
+						const body = await res.text().catch(() => "");
+						throw new Error(`HanniGram ${res.status}: ${body || res.statusText}`);
+					}
+					ctx.ui.notify(`✓ Memoria eliminada #${id}`, "info");
+					return result(`Deleted observation #${id}.`, { deleted: true, id });
+				}
+
+				case "review": {
+					const items = await api<
+						Array<{ kind: string; id: number; scope?: string; title: string; preview: string; duplicateOfId?: number }>
+					>(
+						`/api/review?${scope(ctx.cwd, {
+							limit: String(params.limit ?? 20),
+							...(rowScope ? { scope: rowScope } : {}),
+						})}`,
+					);
+					if (items.length === 0) return result("Nothing to review.", []);
+					const text = items
+						.map(
+							(i) =>
+								`[${i.kind}] #${i.id} (${i.scope ?? "project"}) ${bound(i.title, MAX_TITLE_CHARS)}`
+								+ (i.duplicateOfId ? ` ~ duplicate of #${i.duplicateOfId}` : "")
+								+ `\n  ${i.preview}`,
+						)
+						.join("\n");
+					return result(text, items);
+				}
+
+				case "session_summary": {
+					if (!params.summary) return result("action=session_summary needs summary.", { ok: false });
+					const sessionId = params.sessionId ?? `pi-${Date.now().toString(36)}`;
+					await api(`/api/sessions/start?${scope(ctx.cwd)}`, {
+						method: "POST",
+						body: JSON.stringify({ sessionId }),
+					});
+					await api(`/api/sessions/end?${scope(ctx.cwd)}`, {
+						method: "POST",
+						body: JSON.stringify({
+							sessionId,
+							summary: params.summary,
+							goal: params.goal,
+							nextSteps: params.nextSteps,
+						}),
+					});
+					ctx.ui.notify(`✓ Resumen de sesión guardado (${sessionId})`, "info");
+					return result(`Session ${sessionId} summary saved.`, { sessionId });
+				}
+
+				case "suggest_topic_key": {
+					const topics = await api<string[]>(`/api/topics?${scope(ctx.cwd, { limit: String(params.limit ?? 20) })}`);
+					if (topics.length === 0) return result("No topic keys yet.", []);
+					return result(topics.join("\n"), topics);
+				}
+
+				default:
+					return result(`Unknown action '${action}'.`, { ok: false });
 			}
-			ctx.ui.notify(`✓ Memoria #${obs.id} pinned=${obs.pinned}`, "info");
-			return { content: [{ type: "text", text: `Observation #${obs.id} pinned: ${obs.pinned}` }], details: boundedObservation(obs) };
 		},
 	});
 }

@@ -28,7 +28,7 @@ SQLite + FTS5 (~/.hannigram/hannigram.db)
 - **ADR / decisiones** — las observaciones con `type=adr` y `topic_key=adr/<slug>` son decisiones de arquitectura/convención (p.ej. `adr/ui/palette`). Son la base de "respetar estilos": HanniPI las consulta antes de implementar en zonas cubiertas, sin redefinirlas en cada prompt.
 - **Memoria local exportada** — `hannigram init` crea el proyecto en la BD **y** escribe `.hannigram/memory.md` en el proyecto: una vista markdown de las decisiones, para que cualquier harness (o persona) que solo trabaje con ficheros lea la memoria sin depender del daemon. La BD sigue siendo la fuente de verdad. El fichero **no** embebe rutas absolutas de la máquina (solo nombra la ruta por defecto de la BD y su variable de entorno), así que se puede commitear sin filtrar el disco de nadie.
 - **Topic keys** — claves estables (`architecture/auth-model`) para mantener el conocimiento evolutivo en un solo lugar. Guardar con un `topic_key` ya existente **actualiza** la observación (upsert) en vez de crear una versión duplicada.
-- **Corregir sin duplicar** — `hannigram update <id>` (`mem_update` / `PUT /api/observations/{id}`) edita una observación existente: solo cambia los campos que le pasas, conserva `created_at` y mueve `updated_at`, y las filas siguen escopadas a su ámbito.
+- **Corregir sin duplicar** — `hannigram update <id>` (`mem_admin action=update` / `PUT /api/observations/{id}`) edita una observación existente: solo cambia los campos que le pasas, conserva `created_at` y mueve `updated_at`, y las filas siguen escopadas a su ámbito.
 - **Sesiones + handoff** — `session_summary` guarda objetivo, descubrimientos y próximos pasos para que la siguiente sesión recupere el contexto.
 - **Ciclo de vida y revisión** — cada observación tiene un estado (`active` / `needs_review` / `archived`) y un flag `pinned`. Las lecturas devuelven solo `active` por defecto; `archived` es el olvido seguro (la fila se conserva) y queda excluida salvo que se pida con `state=`. Guardar devuelve un aviso `review` compacto cuando sobrescribe un `topic_key` o detecta un casi-duplicado; `GET /api/review` los lista acotados con previews truncados. La inyección automática (`GET /api/context`) se limita a un número fijo de heurísticas globales fijadas (`pinned`) más unas pocas filas recientes del proyecto.
 
@@ -120,11 +120,37 @@ La memoria guarda **contexto combinado y relacionado** — no solo observaciones
 
 El directorio `pi-extension/` es una extensión de Pi que registra las tools `mem_*`. Pi la descubre vía el campo `pi.extensions` de su `package.json` (o añadiendo la ruta al array `extensions` de `~/.pi/agent/settings.json`).
 
-Tools: `mem_current_project`, `mem_save`, `mem_search`, `mem_context`, `mem_timeline`, `mem_get_observation`, `mem_suggest_topic_key`, `mem_session_summary`, `mem_update`, `mem_review`, `mem_promote`, `mem_state`, `mem_pin`.
+Tools: `mem_search`, `mem_save`, `mem_get` y `mem_admin` (SPEC-002). La superficie está consolidada a propósito: las 14 tools anteriores costaban 1.734 tokens de esquema por turno — más que todo el harness — y estas cuatro cuestan 656 (medido con `bench/ts/mem_tool_cost.mjs`). Las descripciones son imperativas y cortas, y el contrato de cada campo vive en el `description` del campo, no en el de la tool.
 
-`mem_save` acepta `scope=project|global` y `mem_search` acepta `scope=project|global|all` (cada acierto llega etiquetado con su origen); `mem_update`, `mem_state`, `mem_pin` y `mem_delete` aceptan `scope` para elegir a qué ámbito pertenece la fila (así `mem_delete` alcanza la memoria global). `mem_promote` acepta `allowArchived`: una fuente `archived` se rechaza por defecto y el rechazo llega como resultado (`outcome=refused`, `reason=source_archived`), no como error.
+| tool | qué hace | selector |
+|---|---|---|
+| `mem_search` | busca en memoria de proyecto y global (aciertos = previews, nunca el cuerpo entero) | `query`, `type`, `topicKey`, `scope=project\|global\|all` |
+| `mem_save` | guarda o actualiza una observación (upsert por `topicKey`) | `scope=project\|global` |
+| `mem_get` | lee: una fila, el contexto reciente, el histórico de un topic o el proyecto actual | `kind=id\|context\|topic\|project` |
+| `mem_admin` | mantenimiento de filas existentes | `action=state\|pin\|promote\|update\|delete\|review\|session_summary\|suggest_topic_key` |
 
-Todas las tools son **bajo demanda**: la extensión no inyecta memoria en el prompt por sí sola ni inyecta texto completo de una observación. Toda lectura orientada al modelo (`mem_get_observation`, `mem_search`, `mem_timeline`, `mem_update`, `mem_promote`, `mem_state`, `mem_pin`) acota cada campo de texto (2000 caracteres, con `…`) tanto en el texto renderizado como en el payload de `details`, igual que los caps del servidor MCP; `mem_timeline` además se limita a un máximo de 50 filas por clave.
+Cada tool anterior mantiene su ruta nueva (la tabla la verifica `verify-extension.mjs` contra este README):
+
+| tool anterior (SPEC-002) | ruta nueva |
+|---|---|
+| `mem_search` | `mem_search` |
+| `mem_save` | `mem_save` |
+| `mem_current_project` | `mem_get` `kind=project` |
+| `mem_context` | `mem_get` `kind=context` |
+| `mem_get_observation` | `mem_get` `kind=id` |
+| `mem_timeline` | `mem_get` `kind=topic` |
+| `mem_state` | `mem_admin` `action=state` |
+| `mem_pin` | `mem_admin` `action=pin` |
+| `mem_promote` | `mem_admin` `action=promote` |
+| `mem_update` | `mem_admin` `action=update` |
+| `mem_delete` | `mem_admin` `action=delete` |
+| `mem_review` | `mem_admin` `action=review` |
+| `mem_session_summary` | `mem_admin` `action=session_summary` |
+| `mem_suggest_topic_key` | `mem_admin` `action=suggest_topic_key` |
+
+`mem_save` acepta `scope=project|global` y `mem_search` acepta `scope=project|global|all` (cada acierto llega etiquetado con su origen); `mem_admin` acepta `scope` en las acciones que operan sobre una fila (`state`, `pin`, `update`, `delete`) y en `review`, para elegir a qué ámbito pertenece la fila (así `action=delete` alcanza la memoria global). `action=promote` acepta `allowArchived`: una fuente `archived` se rechaza por defecto y el rechazo llega como resultado (`outcome=refused`, `reason=source_archived`), no como error. `action=update` no cambia el esquema de la tool: los campos a parchear van en `fields` (solo cambian los que envías, `""` limpia uno).
+
+Todas las tools son **bajo demanda**: la extensión no inyecta memoria en el prompt por sí sola ni inyecta texto completo de una observación. Toda lectura orientada al modelo (`mem_search`, `mem_get` en todos sus `kind`, `mem_admin action=promote`) acota cada campo de texto (2000 caracteres, con `…`) tanto en el texto renderizado como en el payload de `details`, igual que los caps del servidor MCP.
 
 ```bash
 cd pi-extension && npm install   # typebox + jiti (para el script de verificación)
@@ -159,6 +185,8 @@ Además de la integración nativa con HanniPI, HanniGram trae un **servidor MCP 
 - Todo **dato diagnóstico va a stderr**; stdout es solo el canal de protocolo.
 
 Tools expuestas (mismo motor que la API de memoria): `mem_current_project`, `mem_save`, `mem_search`, `mem_context`, `mem_get_observation`, `mem_timeline`, `mem_suggest_topic_key`, `mem_delete`, `mem_session_summary`, `mem_update`, `mem_review`, `mem_promote`, `mem_state`, `mem_pin`.
+
+Nota: esta superficie MCP **no** está consolidada como la extensión nativa (SPEC-002): mantiene los 14 nombres uno a uno, porque es opcional y está apagada por defecto. Si la activas en un harness, pagas su esquema completo (~1.7k tokens); la extensión nativa de Pi es la ruta barata (4 tools, ~656 tokens).
 
 ## Releases
 

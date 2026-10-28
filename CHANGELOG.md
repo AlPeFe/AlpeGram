@@ -28,6 +28,16 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Changed
 
+- **The native Pi surface is 4 tools instead of 14 (SPEC-002).** The `mem_*` schemas cost 1,734
+  tokens of the fixed per-turn budget — more than the whole harness (1,156) and 43% of a turn's
+  fixed cost — so the extension now registers `mem_search`, `mem_save`, `mem_get` and `mem_admin`.
+  `mem_get` absorbs the old read tools as `kind=id|context|topic|project`; `mem_admin` absorbs the
+  maintenance ones as `action=state|pin|promote|update|delete|review|session_summary|suggest_topic_key`
+  (patched fields travel in `fields`); `mem_search` and `mem_save` keep their names and semantics.
+  Measured with `gpt-tokenizer` over the serialized schemas: 1,734 -> 656 tokens (-62%), and the
+  fixed per-turn cost of the full harness with the memory layer goes 3,469 -> 2,391. No capability
+  was dropped: `verify-extension.mjs` asserts one documented route per removed tool (the README
+  table) and re-runs the F2/F3/F4 regressions through the new paths.
 - **Memory search relaxes `AND` to `OR` with bm25 ranking.** `HanniGramStore.Search` opened with a
   strict all-terms query, so one absent word turned a good query into zero hits (the "AND trap") and
   any paraphrase that shared no literal term returned nothing. The primary path is now an `OR` of the
