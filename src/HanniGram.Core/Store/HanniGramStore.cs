@@ -6,7 +6,9 @@ namespace HanniGram.Core.Store;
 /// <summary>
 /// SQLite + FTS5 store for HanniGram. One global database file (default
 /// ~/.hannigram/hannigram.db) holding all projects, each with its own memory
-/// namespace. FTS5 powers full-text search over observations.
+/// namespace. Two FTS5 indexes power full-text search over observations: a trigram
+/// one (substrings, typos, identifiers) and a word one (porter-stemmed prose), with
+/// query-shape routing and mutual fallback between them.
 /// </summary>
 public sealed class HanniGramStore : IDisposable
 {
@@ -42,7 +44,14 @@ public sealed class HanniGramStore : IDisposable
     //     injection budget can select pinned heuristics. Existing rows migrate to
     //     active / unpinned. The FTS column set is unchanged, but the version bump
     //     runs the standard one-off FTS recreate (the migration shape is shared).
-    private const int SchemaVersion = 4;
+    // v5: a SECOND FTS index (observations_fts_words, tokenize='porter unicode61')
+    //     joins the trigram one. The trigram tokenizer is what gives typos and
+    //     identifiers their recall, but it has no word boundaries and no stemming,
+    //     so it spreads IDF across every overlapping gram and ranks natural-language
+    //     queries worse. Search now routes by query shape (identifier/typo -> trigram,
+    //     plain words -> words index). The trigram tokenizer is deliberately NOT
+    //     touched; the words index is additive, and the bump rebuilds both.
+    private const int SchemaVersion = 5;
 
     private void Initialize()
     {
@@ -104,21 +113,23 @@ public sealed class HanniGramStore : IDisposable
         EnsureObservationLifecycleColumns();
         Exec("CREATE INDEX IF NOT EXISTS idx_obs_project_state_updated ON observations(project_id, state, updated_at_utc DESC);");
 
-        // FTS5 trigram index: typo-tolerant and substring/CJK search. Built/patched ONLY
-        // when the schema version advances, not on every open. The drop+recreate is
-        // external-content safe (observations rows are untouched; 'rebuild' re-indexes).
+        // FTS5 indexes: a trigram one (typo-tolerant, substring/CJK) and a words one
+        // (porter-stemmed, for natural language). Built/patched ONLY when the schema
+        // version advances, not on every open. The drop+recreate is external-content
+        // safe (observations rows are untouched; 'rebuild' re-indexes).
         // Column order is part of the contract: the FTS5 'delete' command used by the
         // sync triggers must pass OLD values back in exactly this order.
         if (GetUserVersion() < SchemaVersion)
         {
-            // Trigger/table ordering matters. observations_fts is external-content and
-            // the sync triggers reference it by name, so dropping the table while the
+            // Trigger/table ordering matters. The FTS tables are external-content and
+            // the sync triggers reference them by name, so dropping a table while its
             // triggers still exist leaves them dangling and the NEXT write fails with
-            // "no such table: observations_fts". Drop triggers, then the table, then
-            // recreate both, then rebuild the index once from the content table.
+            // "no such table: observations_fts". Drop triggers, then the tables, then
+            // recreate both, then rebuild the indexes once from the content table.
             DropFtsSyncTriggers();
-            Exec("DROP TABLE IF EXISTS observations_fts;");
-            CreateFtsTable();
+            Exec($"DROP TABLE IF EXISTS {FtsTrigramTable};");
+            Exec($"DROP TABLE IF EXISTS {FtsWordsTable};");
+            CreateFtsTables();
             CreateFtsSyncTriggers();
             RebuildFts();
             EnsureSessionsUniqueIndex();
@@ -126,9 +137,15 @@ public sealed class HanniGramStore : IDisposable
         }
         else
         {
-            // Already migrated. Re-assert the triggers: they are the only thing that
-            // keeps the index in sync, and a database written by an intermediate
-            // build can carry the table without them.
+            // Already migrated. Re-assert both tables and the triggers: the triggers
+            // are the only thing that keeps the indexes in sync, and a database written
+            // by an intermediate build can carry one table without the other. A missing
+            // table is created empty, so it is rebuilt immediately (create + rebuild
+            // only on that repair path; a normal open is two sqlite_master lookups).
+            var trigramTableExisted = TableExists(FtsTrigramTable);
+            var wordsTableExisted = TableExists(FtsWordsTable);
+            CreateFtsTables();
+            if (!trigramTableExisted || !wordsTableExisted) RebuildFts();
             CreateFtsSyncTriggers();
             // Re-assert the sessions unique index the same way: a build that wrote
             // SchemaVersion 3 without the index must still be repaired on open.
@@ -136,47 +153,92 @@ public sealed class HanniGramStore : IDisposable
         }
     }
 
-    /// <summary>Create the external-content FTS index over <c>observations</c>.</summary>
-    private void CreateFtsTable() => Exec(@"
-        CREATE VIRTUAL TABLE IF NOT EXISTS observations_fts USING fts5(
-            title, content, what, why, where_, learned, topic_key, type,
-            tokenize='trigram',
-            content='observations', content_rowid='id'
-        );
-    ");
+    // The two FTS indexes over observations. Both are external-content over the same
+    // columns; only the tokenizer differs. Names are interpolated into SQL, so they
+    // are constants and never caller input.
+    private const string FtsTrigramTable = "observations_fts";
+    private const string FtsWordsTable = "observations_fts_words";
+
+    /// <summary>True when <paramref name="table"/> exists in the schema.</summary>
+    private bool TableExists(string table)
+    {
+        using var cmd = CreateCommand();
+        cmd.CommandText = "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = $n";
+        cmd.Parameters.AddWithValue("$n", table);
+        return cmd.ExecuteScalar() is not null;
+    }
 
     /// <summary>
-    /// The standard FTS5 external-content trigger triple. observations_fts is an
-    /// EXTERNAL-CONTENT table: it must never be written with a plain INSERT/DELETE
-    /// (that corrupts the index and SQLite then reports "database disk image is
-    /// malformed" on the next write). The 'delete' command requires the OLD column
-    /// values, in the FTS column order declared in <see cref="CreateFtsTable"/>.
-    /// With these triggers, indexing is O(1) per write and runs inside the writer's
-    /// transaction, instead of rebuilding the whole corpus.
+    /// Create the two external-content FTS indexes over <c>observations</c>: the
+    /// trigram one (unchanged: it is what carries typos, substrings and identifiers)
+    /// and the word one (<c>porter unicode61</c>: word boundaries plus English
+    /// stemming, so bm25 discriminates on real terms instead of overlapping grams).
+    /// Same columns, same content table, so the two can be ranked independently and
+    /// a caller can fall back from one to the other.
     /// </summary>
-    private void CreateFtsSyncTriggers() => Exec(@"
-        CREATE TRIGGER IF NOT EXISTS observations_fts_ai AFTER INSERT ON observations BEGIN
-            INSERT INTO observations_fts(rowid, title, content, what, why, where_, learned, topic_key, type)
-            VALUES (new.id, new.title, new.content, new.what, new.why, new.where_, new.learned, new.topic_key, new.type);
-        END;
-        CREATE TRIGGER IF NOT EXISTS observations_fts_ad AFTER DELETE ON observations BEGIN
-            INSERT INTO observations_fts(observations_fts, rowid, title, content, what, why, where_, learned, topic_key, type)
-            VALUES ('delete', old.id, old.title, old.content, old.what, old.why, old.where_, old.learned, old.topic_key, old.type);
-        END;
-        CREATE TRIGGER IF NOT EXISTS observations_fts_au AFTER UPDATE ON observations BEGIN
-            INSERT INTO observations_fts(observations_fts, rowid, title, content, what, why, where_, learned, topic_key, type)
-            VALUES ('delete', old.id, old.title, old.content, old.what, old.why, old.where_, old.learned, old.topic_key, old.type);
-            INSERT INTO observations_fts(rowid, title, content, what, why, where_, learned, topic_key, type)
-            VALUES (new.id, new.title, new.content, new.what, new.why, new.where_, new.learned, new.topic_key, new.type);
-        END;
-    ");
+    private void CreateFtsTables()
+    {
+        Exec($@"
+            CREATE VIRTUAL TABLE IF NOT EXISTS {FtsTrigramTable} USING fts5(
+                title, content, what, why, where_, learned, topic_key, type,
+                tokenize='trigram',
+                content='observations', content_rowid='id'
+            );
+        ");
+        Exec($@"
+            CREATE VIRTUAL TABLE IF NOT EXISTS {FtsWordsTable} USING fts5(
+                title, content, what, why, where_, learned, topic_key, type,
+                tokenize='porter unicode61',
+                content='observations', content_rowid='id'
+            );
+        ");
+    }
 
-    /// <summary>Remove the sync triggers before their table is dropped or recreated.</summary>
-    private void DropFtsSyncTriggers() => Exec(@"
-        DROP TRIGGER IF EXISTS observations_fts_ai;
-        DROP TRIGGER IF EXISTS observations_fts_ad;
-        DROP TRIGGER IF EXISTS observations_fts_au;
-    ");
+    /// <summary>
+    /// The standard FTS5 external-content trigger triple, installed for BOTH indexes.
+    /// They are EXTERNAL-CONTENT tables: they must never be written with a plain
+    /// INSERT/DELETE (that corrupts the index and SQLite then reports "database disk
+    /// image is malformed" on the next write). The 'delete' command requires the OLD
+    /// column values, in the FTS column order declared in <see cref="CreateFtsTables"/>.
+    /// With these triggers, indexing is O(1) per write and runs inside the writer's
+    /// transaction, instead of rebuilding the whole corpus: one write fans out to two
+    /// indexes, which is the write cost the dual-index design accepts.
+    /// </summary>
+    private void CreateFtsSyncTriggers()
+    {
+        foreach (var table in new[] { FtsTrigramTable, FtsWordsTable })
+        {
+            Exec($@"
+                CREATE TRIGGER IF NOT EXISTS {table}_ai AFTER INSERT ON observations BEGIN
+                    INSERT INTO {table}(rowid, title, content, what, why, where_, learned, topic_key, type)
+                    VALUES (new.id, new.title, new.content, new.what, new.why, new.where_, new.learned, new.topic_key, new.type);
+                END;
+                CREATE TRIGGER IF NOT EXISTS {table}_ad AFTER DELETE ON observations BEGIN
+                    INSERT INTO {table}({table}, rowid, title, content, what, why, where_, learned, topic_key, type)
+                    VALUES ('delete', old.id, old.title, old.content, old.what, old.why, old.where_, old.learned, old.topic_key, old.type);
+                END;
+                CREATE TRIGGER IF NOT EXISTS {table}_au AFTER UPDATE ON observations BEGIN
+                    INSERT INTO {table}({table}, rowid, title, content, what, why, where_, learned, topic_key, type)
+                    VALUES ('delete', old.id, old.title, old.content, old.what, old.why, old.where_, old.learned, old.topic_key, old.type);
+                    INSERT INTO {table}(rowid, title, content, what, why, where_, learned, topic_key, type)
+                    VALUES (new.id, new.title, new.content, new.what, new.why, new.where_, new.learned, new.topic_key, new.type);
+                END;
+            ");
+        }
+    }
+
+    /// <summary>Remove the sync triggers before their tables are dropped or recreated.</summary>
+    private void DropFtsSyncTriggers()
+    {
+        foreach (var table in new[] { FtsTrigramTable, FtsWordsTable })
+        {
+            Exec($@"
+                DROP TRIGGER IF EXISTS {table}_ai;
+                DROP TRIGGER IF EXISTS {table}_ad;
+                DROP TRIGGER IF EXISTS {table}_au;
+            ");
+        }
+    }
 
     // =====================================================================
     // Lifecycle schema (v4)
@@ -862,6 +924,16 @@ public sealed class HanniGramStore : IDisposable
     /// heuristic. Results stay bounded by <paramref name="limit"/> and ordered
     /// deterministically (bm25 rank, then id).
     /// <para>
+    /// Two indexes stand behind this: <c>observations_fts</c> (trigram: substrings,
+    /// typos, identifiers) and <c>observations_fts_words</c> (word boundaries +
+    /// porter stemming: natural language). The query SHAPE picks the first pass —
+    /// code-shaped queries go to trigram, plain words go to the words index — and an
+    /// empty first pass falls through to the other index, then to the trigram
+    /// OR-of-grams fuzzy pass. Ordering matters: the routed index answers first so a
+    /// natural-language query is ranked on real terms, and the fallbacks exist so a
+    /// routed miss never becomes a zero-hit answer when the other index could see it.
+    /// </para>
+    /// <para>
     /// <paramref name="state"/> selects the lifecycle filter exactly like
     /// <see cref="ListObservations(IReadOnlyList{MemoryNamespace}, int, string?)"/>:
     /// absent or unknown → <c>active</c> only; a concrete state → that state only;
@@ -878,48 +950,66 @@ public sealed class HanniGramStore : IDisposable
                 return Array.Empty<SearchHit>();
             }
 
-            // FtsQuery drops every term shorter than the trigram minimum, so "ab",
-            // "a", "" and whitespace-only all escape to the empty string. FTS5
-            // rejects MATCH '' with `fts5: syntax error near ""`, which used to
-            // bubble up as an HTTP 500. A query with no searchable term has no hits
-            // by definition, so return early instead of touching the index.
-            var ftsQuery = FtsQuery(query);
-            if (ftsQuery.Length == 0)
+            // Both query builders drop every term shorter than the trigram minimum, so
+            // "ab", "a", "" and whitespace-only all escape to the empty string. FTS5
+            // rejects MATCH '' with `fts5: syntax error near ""`, which used to bubble
+            // up as an HTTP 500. A query with no searchable term has no hits by
+            // definition, so return early instead of touching an index.
+            var codeShaped = LooksLikeCode(query);
+            var primaryQuery = codeShaped ? FtsTrigramQuery(query) : FtsWordsQuery(query);
+            if (primaryQuery.Length == 0)
             {
                 return Array.Empty<SearchHit>();
             }
 
             var filter = ReadState(state);
-            // Primary path: OR of the terms ranked by bm25 (see FtsQuery). This is
-            // the relaxed-AND candidate set; bm25 orders it by how many terms — and
-            // how rare terms — each row satisfies.
-            var hits = SearchCore(namespaces, ftsQuery, limit, type, topicKey, filter);
-            // Second pass, kept on purpose: the trigram tokenizer matches substrings,
-            // not typos. When the phrase match finds nothing (a single misspelled
-            // token, or a query whose terms are all absent from the corpus), retry
-            // with OR of the query's trigrams per token so a typo'd word (1-3 chars
-            // off in a long word) still matches documents sharing enough trigrams,
-            // ranked by bm25.
+            var hits = SearchCore(namespaces, codeShaped ? FtsTrigramTable : FtsWordsTable,
+                primaryQuery, limit, type, topicKey, filter);
+
+            // First fallback: the other index. A word index knows "pooled" and
+            // "pooling" are the same term but cannot match a substring; the trigram
+            // index is the reverse. Whichever was routed first, the other one gets the
+            // query when the routed pass found nothing at all.
+            if (hits.Count == 0)
+            {
+                var secondaryQuery = codeShaped ? FtsWordsQuery(query) : FtsTrigramQuery(query);
+                if (secondaryQuery.Length != 0)
+                {
+                    hits = SearchCore(namespaces, codeShaped ? FtsWordsTable : FtsTrigramTable,
+                        secondaryQuery, limit, type, topicKey, filter);
+                }
+            }
+
+            // Second fallback, kept on purpose: the trigram tokenizer matches substrings,
+            // not typos. When the phrase match finds nothing (a single misspelled token,
+            // or a query whose terms are all absent from the corpus), retry with OR of
+            // the query's trigrams per token so a typo'd word (1-3 chars off in a long
+            // word) still matches documents sharing enough trigrams, ranked by bm25.
             if (hits.Count == 0 && query.Where(char.IsLetterOrDigit).Count() >= 6)
             {
                 var fallback = FtsTrigramFallback(query);
                 if (fallback.Length != 0)
                 {
-                    hits = SearchCore(namespaces, fallback, limit, type, topicKey, filter);
+                    hits = SearchCore(namespaces, FtsTrigramTable, fallback, limit, type, topicKey, filter);
                 }
             }
             return hits;
         }
     }
 
-    private List<SearchHit> SearchCore(IReadOnlyList<MemoryNamespace> namespaces, string ftsQuery, int limit, string? type = null, string? topicKey = null, string state = MemoryStates.Active)
+    private List<SearchHit> SearchCore(IReadOnlyList<MemoryNamespace> namespaces, string ftsTable, string ftsQuery, int limit, string? type = null, string? topicKey = null, string state = MemoryStates.Active)
     {
         var list = new List<SearchHit>();
-        // Hard guarantee for every caller, including the trigram fallback: an FTS5
-        // MATCH is never issued with an empty expression.
+        // Hard guarantee for every caller, including the fallbacks: an FTS5 MATCH is
+        // never issued with an empty expression, and the table name is one of the two
+        // index constants (it is interpolated into SQL, so it can never be caller text).
         if (string.IsNullOrEmpty(ftsQuery) || namespaces.Count == 0)
         {
             return list;
+        }
+        if (ftsTable is not (FtsTrigramTable or FtsWordsTable))
+        {
+            throw new ArgumentException($"Unknown FTS index: {ftsTable}", nameof(ftsTable));
         }
 
         var ids = namespaces.Select(n => n.ProjectId).Distinct().ToArray();
@@ -930,11 +1020,11 @@ public sealed class HanniGramStore : IDisposable
         // One MATCH across every requested project_id keeps bm25 comparable
         // between scopes; ORDER BY (rank, id) is deterministic and LIMIT bounds
         // the merged result set.
-        var sql = @"
-            SELECT o.id, o.title, o.content, o.topic_key, o.type, o.created_at_utc, bm25(observations_fts) AS rank, o.project_id, o.state
-            FROM observations_fts
-            JOIN observations o ON o.id = observations_fts.rowid
-            WHERE observations_fts MATCH $q AND o.project_id IN (";
+        var sql = $@"
+            SELECT o.id, o.title, o.content, o.topic_key, o.type, o.created_at_utc, bm25({ftsTable}) AS rank, o.project_id, o.state
+            FROM {ftsTable}
+            JOIN observations o ON o.id = {ftsTable}.rowid
+            WHERE {ftsTable} MATCH $q AND o.project_id IN (";
         sql += string.Join(", ", ids.Select((_, i) => "$p" + i));
         sql += ")";
         if (type is not null) sql += " AND o.type = $ty";
@@ -1412,18 +1502,22 @@ public sealed class HanniGramStore : IDisposable
     }
 
     /// <summary>
-    /// Rebuild the FTS index from the content table. FTS5 EXTERNAL-CONTENT tables
-    /// must NOT be written directly: a manual INSERT/DELETE against observations_fts
-    /// corrupts the index ("database disk image is malformed" on the first write
-    /// after a rebuild). 'rebuild' is the canonical external-content sync — it is
-    /// O(N) but safe. It runs ONLY on schema migration (Initialize); the write path
-    /// is served by the O(1) sync triggers, so no save/delete touches the corpus.
+    /// Rebuild BOTH FTS indexes from the content table. FTS5 EXTERNAL-CONTENT tables
+    /// must NOT be written directly: a manual INSERT/DELETE against them corrupts the
+    /// index ("database disk image is malformed" on the first write after a rebuild).
+    /// 'rebuild' is the canonical external-content sync — it is O(N) but safe. It runs
+    /// only on schema migration (Initialize) or on the missing-table repair path; the
+    /// write path is served by the O(1) sync triggers, so no save/delete touches the
+    /// corpus.
     /// </summary>
     private void RebuildFts()
     {
-        using var cmd = CreateCommand();
-        cmd.CommandText = "INSERT INTO observations_fts(observations_fts) VALUES('rebuild');";
-        cmd.ExecuteNonQuery();
+        foreach (var table in new[] { FtsTrigramTable, FtsWordsTable })
+        {
+            using var cmd = CreateCommand();
+            cmd.CommandText = $"INSERT INTO {table}({table}) VALUES('rebuild');";
+            cmd.ExecuteNonQuery();
+        }
     }
 
     // Minimum trigger length of the trigram tokenizer. A term shorter than this
@@ -1443,23 +1537,107 @@ public sealed class HanniGramStore : IDisposable
     private static string[] QueryTokens(string raw) =>
         raw.Split(new[] { ' ', '\t', '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries);
 
-    private static string FtsQuery(string raw)
+    /// <summary>
+    /// Escape FTS5 special chars and OR the terms, for the TRIGRAM index. The AND
+    /// version ("every term must be present") is the single biggest recall sink
+    /// measured in the run-1 benchmark: one absent word turned a good query into zero
+    /// hits (the "AND trap"), and paraphrase queries never satisfied it at all. With
+    /// OR, every document sharing at least one term stays in the candidate set and
+    /// bm25 does the ordering: it sums one weighted contribution per matching term, so
+    /// documents that satisfy more (and rarer) terms rank first, which recovers the
+    /// focus AND was supposed to give without its zero-recall cliff.
+    /// The trigram tokenizer matches substrings of >=3 chars; drop 1-2-char terms
+    /// (they would match nothing / could error) so a typo'd fragment still finds data.
+    /// </summary>
+    private static string FtsTrigramQuery(string raw)
     {
-        // Escape FTS5 special chars and OR the terms. The AND version ("every term
-        // must be present") is the single biggest recall sink measured in the run-1
-        // benchmark: one absent word turned a good query into zero hits (the
-        // "AND trap"), and paraphrase queries never satisfied it at all. With OR,
-        // every document sharing at least one term stays in the candidate set and
-        // bm25 does the ordering: it sums one weighted contribution per matching
-        // term, so documents that satisfy more (and rarer) terms rank first, which
-        // recovers the focus AND was supposed to give without its zero-recall cliff.
-        // Trigram tokenizer matches substrings of >=3 chars; drop 1-2-char terms
-        // (they would match nothing / could error) so a typo'd fragment still finds
-        // data.
         var terms = QueryTokens(raw)
             .Where(t => t.Length >= TrigramLength)
             .Select(t => "\"" + t.Replace("\"", "\"\"") + "\"");
         return string.Join(" OR ", terms);
+    }
+
+    /// <summary>
+    /// OR the query's words for the WORDS index (<c>porter unicode61</c>). That
+    /// tokenizer splits on word boundaries, so a token is reduced to its alphanumeric
+    /// parts before it is quoted: quoting <c>"auth-storage.ts"</c> as one term would
+    /// make FTS5 look for a three-token PHRASE in exactly that order, while the index
+    /// stores <c>auth</c>, <c>storage</c>, <c>ts</c> separately. Parts keep the same
+    /// 3-char floor as the trigram path, so both builders return "" for the same
+    /// no-searchable-term inputs. Duplicates are dropped: repeating a term would only
+    /// double its bm25 contribution.
+    /// </summary>
+    private static string FtsWordsQuery(string raw)
+    {
+        var seen = new HashSet<string>(StringComparer.Ordinal);
+        var terms = new List<string>();
+        foreach (var token in QueryTokens(raw))
+        {
+            foreach (var part in WordParts(token))
+            {
+                if (part.Length < TrigramLength) continue;
+                if (seen.Add(part)) terms.Add("\"" + part + "\"");
+            }
+        }
+        return string.Join(" OR ", terms);
+    }
+
+    /// <summary>
+    /// The alphanumeric runs of a token, lowercased: "auth-storage.ts" → auth,
+    /// storage, ts.
+    /// </summary>
+    private static IEnumerable<string> WordParts(string token)
+    {
+        var start = -1;
+        for (var i = 0; i < token.Length; i++)
+        {
+            if (char.IsLetterOrDigit(token[i]))
+            {
+                if (start < 0) start = i;
+            }
+            else if (start >= 0)
+            {
+                yield return token.Substring(start, i - start).ToLowerInvariant();
+                start = -1;
+            }
+        }
+        if (start >= 0) yield return token.Substring(start).ToLowerInvariant();
+    }
+
+    /// <summary>
+    /// True when the query looks like code rather than prose, which is what decides
+    /// the first index. The trigram tokenizer wins exactly where there are no word
+    /// boundaries to exploit: paths and identifiers (<c>_ . / \ : @ # $ = ( )</c>),
+    /// CamelCase symbols, and short CODE FRAGMENTS — a 1-2 char token that carries a
+    /// digit, like "80" or "bm2". A short all-letter token is the opposite: it is a
+    /// function word ("do", "we", "I", "is"), so the length-only version of this rule
+    /// sent 10 of the 14 natural-language queries in the bench to the trigram index
+    /// and A0 measured as a no-op. Everything else is treated as natural language and
+    /// goes to the words index, where bm25 on real terms and porter stemming
+    /// discriminate better than IDF spread across overlapping grams.
+    /// </summary>
+    private static bool LooksLikeCode(string raw)
+    {
+        foreach (var token in QueryTokens(raw))
+        {
+            if (token.Any(c => c is '_' or '.' or '/' or '\\' or ':' or '@' or '#' or '$' or '=' or '(' or ')'))
+            {
+                return true;
+            }
+            if (token.Count(char.IsLetterOrDigit) < TrigramLength && token.Any(char.IsDigit)) return true;
+            if (HasInnerCapital(token)) return true;
+        }
+        return false;
+    }
+
+    /// <summary>True for CamelCase / PascalCase: a capital right after a lowercase.</summary>
+    private static bool HasInnerCapital(string token)
+    {
+        for (var i = 1; i < token.Length; i++)
+        {
+            if (char.IsUpper(token[i]) && char.IsLower(token[i - 1])) return true;
+        }
+        return false;
     }
 
     /// <summary>

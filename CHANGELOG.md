@@ -7,6 +7,25 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+### Added
+
+- **Second FTS index: `observations_fts_words` (`tokenize='porter unicode61'`) next to the trigram
+  one.** The trigram tokenizer is what carries typos, substrings and identifiers, but it has no word
+  boundaries and no stemming, so its IDF spreads across every overlapping gram and natural-language
+  queries rank worse. `Search` now routes by query shape — code-shaped queries (paths, `_ . / :`
+  punctuation, CamelCase, short tokens carrying a digit) go to the trigram index, prose goes to the
+  words index — falls through to the other index when the routed one returns nothing, and keeps the
+  trigram OR-of-grams fuzzy pass as the last resort. The trigram tokenizer itself is untouched, and
+  both indexes are external-content with their own trigger triple. `SchemaVersion` moves **4 → 5**,
+  which rebuilds both indexes once; a database that lost one of the two tables is repaired and
+  re-indexed on open. Measured on the 42-query / 35-observation bench: recall@1 0.800 -> 0.825,
+  recall@5 0.875 -> 0.900, semantic recall@1 0.429 -> 0.500, semantic recall@5 0.643 -> 0.714, FPR
+  0.000, p95 5.7 ms. Trade-off to watch: recall@3 0.875 -> 0.850 (one semantic query moved from rank
+  3 to rank 4), ~19 bytes more payload per query, and two index writes per save.
+  Note: a first version of the routing rule treated ANY 1-2 char token as code, so function words
+  ("do", "we", "I") sent 10 of the 14 prose queries to the trigram index and the change measured as
+  a no-op (0.800 -> 0.800). The rule now requires a digit in the short token.
+
 ### Changed
 
 - **Memory search relaxes `AND` to `OR` with bm25 ranking.** `HanniGramStore.Search` opened with a

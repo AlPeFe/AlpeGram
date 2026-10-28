@@ -105,8 +105,10 @@ public sealed class FtsTriggerTests
 
     /// <summary>
     /// Behavioural proof that a save no longer re-indexes the whole corpus: wipe the
-    /// index behind the store's back, then save one row. A triggering write indexes
+    /// indexes behind the store's back, then save one row. A triggering write indexes
     /// only that row; a rebuild-on-write would have restored the wiped row too.
+    /// Both indexes are wiped (the trigram one and the words one): leaving either
+    /// populated would answer the query from the surviving index and prove nothing.
     /// </summary>
     [Fact]
     public void WritePath_DoesNotRebuildTheWholeIndex()
@@ -122,6 +124,7 @@ public sealed class FtsTriggerTests
 
         // Valid FTS5 command for an external-content table (not a plain INSERT/DELETE).
         db.Execute("INSERT INTO observations_fts(observations_fts) VALUES('delete-all');");
+        db.Execute("INSERT INTO observations_fts_words(observations_fts_words) VALUES('delete-all');");
 
         using (var store = db.OpenStore())
         {
